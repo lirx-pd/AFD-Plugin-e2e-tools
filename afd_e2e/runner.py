@@ -1,4 +1,4 @@
-"""Owned subprocess lifecycle, evaluation and device-lease cleanup."""
+"""Owned subprocess lifecycle, evaluation and cleanup."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from pathlib import Path
 
 from . import __version__, coverage, evaluation
 from .config import TOOL_ROOT, Case
-from .devices import Lease, acquire, release
 from .planner import Service, build_services, environment, network, runtime_environment
 from .reporting import LOG_FAILURE, is_profiler_advisory, report_text
 from .process_utils import (
@@ -268,6 +267,11 @@ def _stop_children(
 
 
 def execute(case: Case) -> dict:
+    if case.devices is None:
+        raise ValueError(
+            "Specify --device/--devices or inherit ASCEND_RT_VISIBLE_DEVICES "
+            "through npu run"
+        )
     if not (case.repo / "afd_plugin").is_dir():
         raise ValueError(
             f"Sibling afd-plugin not found at {case.repo}; use --repo to override"
@@ -284,7 +288,7 @@ def execute(case: Case) -> dict:
         "run_dir": str(run_dir),
         "status": "running",
         "started_at": datetime.now(timezone.utc).isoformat(),
-        "stage": "allocation",
+        "stage": "devices",
         "errors": [],
         "process_exit_codes": {},
         "inference_status": "running",
@@ -297,7 +301,7 @@ def execute(case: Case) -> dict:
     reporting_errors = []
 
     def save_json(path, value):
-        # Reporting failures must not interrupt process cleanup or device release.
+        # Reporting failures must not interrupt process cleanup.
         try:
             write_json(path, value)
         except OSError as exc:
@@ -345,7 +349,6 @@ def execute(case: Case) -> dict:
 
     summary["stage_started_at"] = summary["started_at"]
     progress(force=True)
-    lease: Lease | None = None
     children: list[ManagedProcess] = []
     services: list[ManagedProcess] = []
     history = []
@@ -388,28 +391,23 @@ def execute(case: Case) -> dict:
     for sig in previous_handlers:
         signal.signal(sig, cancel)
     try:
-        lease = acquire(case, run_id)
-        manifest["allocation"] = {
-            "devices": lease.devices,
-            "unused_devices": lease.devices[case.required_devices :],
-            "managed": lease.managed,
-            "lease": lease.response,
-        }
+        manifest["devices"] = case.devices
+        manifest["unused_devices"] = case.devices[case.required_devices :]
         write_json(run_dir / "manifest.json", manifest)
-        specifications = build_services(case, lease.devices, run_id)
+        specifications = build_services(case, case.devices, run_id)
         manifest["services"] = [service.to_dict() for service in specifications]
         write_json(run_dir / "manifest.json", manifest)
         probe_service = Service(
             "probe",
-            lease.devices,
+            case.devices,
             (),
-            environment(case, "probe", lease.devices, run_id),
+            environment(case, "probe", case.devices, run_id),
         )
         job_env = runtime_environment(probe_service)
         stage("preflight")
         start_job(
             "preflight",
-            _preflight_command(case, lease.devices),
+            _preflight_command(case, case.devices),
             job_env,
             case.startup_timeout,
         )
@@ -571,28 +569,23 @@ def execute(case: Case) -> dict:
             summary["errors"].extend(cleanup_failures)
             summary["cleanup_failed"] = True
         summary["cleanup_status"] = "failed" if cleanup_failures else "passed"
-        stage("release")
-        if lease is not None:
+        try:
+            survivors = find_processes_matching_environment(
+                {"AFD_E2E_RUN_ID": run_id}
+            )
             try:
-                survivors = find_processes_matching_environment(
-                    {"AFD_E2E_RUN_ID": run_id}
-                )
-                try:
-                    if survivors:
-                        summary["allocation_retained"] = lease.managed
-                        raise RuntimeError(
-                            f"Owned processes still alive: {[p.pid for p in survivors]}; device lease retained"
-                        )
-                finally:
-                    close_process_identities(survivors)
-                release(case, lease, run_id)
-                summary["lease_released"] = lease.managed
-            except Exception as exc:
-                summary["status"] = "failed"
-                summary.setdefault("failed_stage", "release")
-                summary["cleanup_failed"] = True
-                summary["cleanup_status"] = "failed"
-                summary["errors"].append(f"Device cleanup: {exc}")
+                if survivors:
+                    raise RuntimeError(
+                        f"Owned processes still alive: {[p.pid for p in survivors]}"
+                    )
+            finally:
+                close_process_identities(survivors)
+        except Exception as exc:
+            summary["status"] = "failed"
+            summary.setdefault("failed_stage", "cleanup")
+            summary["cleanup_failed"] = True
+            summary["cleanup_status"] = "failed"
+            summary["errors"].append(f"Process cleanup: {exc}")
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
         save_json(run_dir / "diagnostics.json", diagnostics)

@@ -326,7 +326,7 @@ def build_services(
 def describe(case: Case) -> dict:
     from .performance import points
 
-    devices = case.devices or tuple(str(index) for index in range(case.npu_count))
+    devices = case.devices or tuple(str(i) for i in range(case.required_devices))
     return {
         "configuration": case.to_dict(),
         "device_assignment_pending": case.devices is None,

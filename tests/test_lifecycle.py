@@ -90,10 +90,10 @@ def simulated_runtime(monkeypatch, tmp_path):
     ],
 )
 def test_run_lifecycle_with_real_http_and_children(
-    make_case, manager, simulated_runtime, flags
+    make_case, simulated_runtime, flags
 ):
-    platform, record = manager()
-    case = make_case(*simulated_runtime, "--platform", platform, *flags)
+    devices = ",".join(map(str, range(16 if "v4-flash" in flags else 4)))
+    case = make_case(*simulated_runtime, "--device", devices, *flags)
     summary = runner.execute(case)
     assert summary["status"] == "passed", summary["errors"]
     assert (
@@ -103,18 +103,15 @@ def test_run_lifecycle_with_real_http_and_children(
         == "passed"
     )
     assert summary["stage"] == "finished"
-    assert {"startup", "smoke", "gsm8k", "cleanup", "release"} <= summary[
-        "stage_durations"
-    ].keys()
+    assert {"startup", "smoke", "gsm8k", "cleanup"} <= summary["stage_durations"].keys()
     assert summary["elapsed_seconds"] > 0
     assert "Result: passed" in (case.run_dir / "report.txt").read_text()
     assert summary["gsm8k"]["samples"] == 7
-    assert summary["lease_released"]
-    assert record.exists()
     assert all(code is not None for code in summary["process_exit_codes"].values())
-    assert json.loads((case.run_dir / "manifest.json").read_text())["readiness"][
-        "simulated"
-    ]
+    manifest = json.loads((case.run_dir / "manifest.json").read_text())
+    assert manifest["readiness"]["simulated"]
+    assert manifest["devices"] == list(case.devices)
+    assert manifest["unused_devices"] == []
     assert (case.run_dir / "exit-code.txt").read_text() == "0\n"
     if case.dbo:
         assert (
@@ -125,31 +122,29 @@ def test_run_lifecycle_with_real_http_and_children(
         )
 
 
-def test_accuracy_failure_still_releases_devices(
-    make_case, manager, simulated_runtime, monkeypatch
+def test_accuracy_failure_still_cleans_up_children(
+    make_case, simulated_runtime, monkeypatch
 ):
-    platform, record = manager()
     monkeypatch.setenv("AFD_E2E_FAKE_SCORE", "0.1")
-    summary = runner.execute(make_case(*simulated_runtime, "--platform", platform))
+    summary = runner.execute(make_case(*simulated_runtime, "--device", "0,1,2,3"))
     assert summary["status"] == "failed"
     assert any("strict-match" in error for error in summary["errors"])
     assert summary["gsm8k"]["strict_match"] == 0.1
     assert summary["gsm8k"]["threshold"] == 0.27
     assert summary["failed_stage"] == "gsm8k"
     assert "GSM8K: 10.00%" in (Path(summary["run_dir"]) / "report.txt").read_text()
-    assert record.exists()
-    assert summary["lease_released"]
+    assert summary["cleanup_status"] == "passed"
+    assert all(code is not None for code in summary["process_exit_codes"].values())
 
 
 @pytest.mark.parametrize("comm", ["sync", "async"])
 def test_v4_performance_lifecycle_reuses_devices_and_keeps_warmup_separate(
-    make_case, manager, simulated_runtime, comm
+    make_case, simulated_runtime, comm
 ):
-    platform, record = manager()
     case = make_case(
         *simulated_runtime,
-        "--platform",
-        platform,
+        "--device",
+        "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
         "--model",
         "v4-flash",
         "--model-path",
@@ -193,18 +188,18 @@ def test_v4_performance_lifecycle_reuses_devices_and_keeps_warmup_separate(
     assert sum(row["phase"] == "measured" for row in rows) == 24
     assert sum(row["phase"] == "warmup" for row in rows) == 6
     assert "Performance: passed" in (case.run_dir / "report.txt").read_text()
-    assert record.exists() and summary["lease_released"]
+    assert summary["cleanup_status"] == "passed"
+    assert all(code is not None for code in summary["process_exit_codes"].values())
 
 
-def test_performance_failure_keeps_metrics_and_releases_devices(
-    make_case, manager, simulated_runtime, monkeypatch
+def test_performance_failure_keeps_metrics_and_cleans_up_children(
+    make_case, simulated_runtime, monkeypatch
 ):
-    platform, record = manager()
     monkeypatch.setenv("AFD_E2E_FAKE_NO_USAGE", "1")
     case = make_case(
         *simulated_runtime,
-        "--platform",
-        platform,
+        "--device",
+        "0,1,2,3",
         "--test",
         "perf",
         "--perf-mode",
@@ -227,13 +222,13 @@ def test_performance_failure_keeps_metrics_and_releases_devices(
     assert point["completed"] == 0 and point["failed"] == 4
     assert point["metrics"]["tpot_ms"]["mean"] is None
     assert "no token usage" in point["errors"][0]["error"]
-    assert record.exists() and summary["lease_released"]
+    assert summary["cleanup_status"] == "passed"
+    assert all(code is not None for code in summary["process_exit_codes"].values())
 
 
 def test_async_dbo_profiling_advisory_keeps_performance_running(
-    make_case, manager, simulated_runtime, monkeypatch
+    make_case, simulated_runtime, monkeypatch
 ):
-    platform, record = manager()
     message = (
         "(Worker_DP0_EP0 pid=378826) [ERROR] [378826] profiler.py: "
         + PROFILER_PARSE_ADVISORY
@@ -241,8 +236,8 @@ def test_async_dbo_profiling_advisory_keeps_performance_running(
     monkeypatch.setenv("AFD_E2E_FAKE_LIVE_ERROR", message)
     case = make_case(
         *simulated_runtime,
-        "--platform",
-        platform,
+        "--device",
+        "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
         "--model",
         "v4-flash",
         "--model-path",
@@ -285,17 +280,17 @@ def test_async_dbo_profiling_advisory_keeps_performance_running(
         == summary["log_advisories"]
     )
     assert "offline parsing required" in (case.run_dir / "report.txt").read_text()
-    assert record.exists() and summary["lease_released"]
+    assert summary["cleanup_status"] == "passed"
+    assert all(code is not None for code in summary["process_exit_codes"].values())
 
 
 def test_performance_timeout_reads_final_partial_results_after_stopping(
-    make_case, manager, simulated_runtime
+    make_case, simulated_runtime
 ):
-    platform, record = manager()
     case = make_case(
         *simulated_runtime,
-        "--platform",
-        platform,
+        "--device",
+        "0,1,2,3",
         "--test",
         "perf",
         "--perf-mode",
@@ -322,7 +317,8 @@ def test_performance_timeout_reads_final_partial_results_after_stopping(
     point = metrics["points"][0]
     assert metrics["status"] == point["status"] == "cancelled"
     assert point["completed"] == 1 and point["unsubmitted"] == 2
-    assert record.exists() and summary["lease_released"]
+    assert summary["cleanup_status"] == "passed"
+    assert all(code is not None for code in summary["process_exit_codes"].values())
 
 
 @pytest.mark.parametrize("comm", ["sync", "async"])
@@ -334,11 +330,10 @@ def test_performance_timeout_reads_final_partial_results_after_stopping(
     ],
 )
 def test_zero_exit_with_shutdown_fault_is_failure(
-    make_case, manager, simulated_runtime, monkeypatch, comm, fault
+    make_case, simulated_runtime, monkeypatch, comm, fault
 ):
-    platform, record = manager()
     monkeypatch.setenv("AFD_E2E_FAKE_SHUTDOWN_ERROR", fault)
-    case = make_case(*simulated_runtime, "--platform", platform, "--comm", comm)
+    case = make_case(*simulated_runtime, "--device", "0,1,2,3", "--comm", comm)
     summary = runner.execute(case)
     assert summary["status"] == summary["shutdown_status"] == "failed"
     assert summary["failed_stage"] == "shutdown"
@@ -351,7 +346,7 @@ def test_zero_exit_with_shutdown_fault_is_failure(
         evidence["line"] - 1
     ] == fault
     assert summary["log_diagnostics"]["ffn"]["inference"] == []
-    assert record.exists() and summary["lease_released"]
+    assert all(code is not None for code in summary["process_exit_codes"].values())
     assert (case.run_dir / "exit-code.txt").read_text() == "1\n"
     assert (
         "Inference: passed; shutdown: failed; cleanup: passed"
@@ -359,45 +354,42 @@ def test_zero_exit_with_shutdown_fault_is_failure(
     )
 
 
-def test_forced_cleanup_releases_devices_but_fails_shutdown(
-    make_case, manager, simulated_runtime, monkeypatch
+def test_forced_cleanup_stops_children_but_fails_shutdown(
+    make_case, simulated_runtime, monkeypatch
 ):
-    platform, record = manager()
     monkeypatch.setenv("AFD_E2E_FAKE_IGNORE_TERM", "1")
     summary = runner.execute(
-        make_case(*simulated_runtime, "--platform", platform, "--comm", "async")
+        make_case(*simulated_runtime, "--device", "0,1,2,3", "--comm", "async")
     )
     assert summary["inference_status"] == summary["cleanup_status"] == "passed"
     assert summary["status"] == summary["shutdown_status"] == "failed"
     assert summary["failed_stage"] == "shutdown"
     assert any("forced SIGKILL" in error for error in summary["errors"])
     assert summary["process_exit_codes"]["ffn"] == -signal.SIGKILL
-    assert record.exists() and summary["lease_released"]
+    assert all(code is not None for code in summary["process_exit_codes"].values())
 
 
-def test_inference_log_fault_aborts_and_releases_devices(
-    make_case, manager, simulated_runtime, monkeypatch
+def test_inference_log_fault_aborts_and_cleans_up_children(
+    make_case, simulated_runtime, monkeypatch
 ):
-    platform, record = manager()
     monkeypatch.setenv("AFD_E2E_FAKE_LIVE_ERROR", "1")
-    summary = runner.execute(make_case(*simulated_runtime, "--platform", platform))
+    summary = runner.execute(make_case(*simulated_runtime, "--device", "0,1,2,3"))
     assert summary["status"] == summary["inference_status"] == "failed"
     assert summary["failed_stage"] == "smoke"
     assert any("simulated inference failure" in error for error in summary["errors"])
     assert summary["shutdown_status"] == summary["cleanup_status"] == "passed"
-    assert record.exists() and summary["lease_released"]
+    assert all(code is not None for code in summary["process_exit_codes"].values())
 
 
 @pytest.mark.parametrize("comm", ["sync", "async"])
 def test_v4_smoke_checks_answers_in_both_modes(
-    make_case, manager, simulated_runtime, monkeypatch, comm
+    make_case, simulated_runtime, monkeypatch, comm
 ):
-    platform, record = manager()
     monkeypatch.setenv("AFD_E2E_FAKE_WRONG_ANSWER", "1")
     case = make_case(
         *simulated_runtime,
-        "--platform",
-        platform,
+        "--device",
+        "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
         "--model",
         "v4-flash",
         "--model-path",
@@ -410,16 +402,16 @@ def test_v4_smoke_checks_answers_in_both_modes(
     smoke = json.loads((case.run_dir / "smoke.json").read_text())
     assert smoke["answer_checked"]
     assert "Expected 19, got '20'" in smoke["requests"][0]["error"]
-    assert record.exists() and summary["lease_released"]
+    assert summary["cleanup_status"] == "passed"
+    assert all(code is not None for code in summary["process_exit_codes"].values())
 
 
 @pytest.mark.parametrize(
     "failed_file", ["summary.json", "diagnostics.json", "advisories.json", "report.txt"]
 )
 def test_report_write_failure_cannot_skip_cleanup(
-    make_case, manager, simulated_runtime, monkeypatch, failed_file
+    make_case, simulated_runtime, monkeypatch, failed_file
 ):
-    platform, record = manager()
     native_write = Path.write_text
 
     def fail(path, *args, **kwargs):
@@ -428,21 +420,19 @@ def test_report_write_failure_cannot_skip_cleanup(
         return native_write(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", fail)
-    case = make_case(*simulated_runtime, "--platform", platform)
+    case = make_case(*simulated_runtime, "--device", "0,1,2,3")
     summary = runner.execute(case)
     assert summary["status"] == "failed"
     assert summary["failed_stage"] == "reporting"
     assert summary["cleanup_status"] == "passed"
     assert all(code is not None for code in summary["process_exit_codes"].values())
     assert any("simulated full disk" in error for error in summary["errors"])
-    assert record.exists() and summary["lease_released"]
     assert (case.run_dir / "exit-code.txt").read_text() == "1\n"
 
 
 def test_progress_is_readable_before_service_is_ready(
-    make_case, manager, simulated_runtime, monkeypatch
+    make_case, simulated_runtime, monkeypatch
 ):
-    platform, _ = manager()
     native_wait = runner.wait_ready
     native_stop = runner._stop_children
 
@@ -465,16 +455,14 @@ def test_progress_is_readable_before_service_is_ready(
 
     monkeypatch.setattr(runner, "wait_ready", wait)
     monkeypatch.setattr(runner, "_stop_children", stop)
-    assert (
-        runner.execute(make_case(*simulated_runtime, "--platform", platform))["status"]
-        == "passed"
-    )
+    summary = runner.execute(make_case(*simulated_runtime, "--device", "0,1,2,3"))
+    assert summary["status"] == summary["cleanup_status"] == "passed"
+    assert all(code is not None for code in summary["process_exit_codes"].values())
 
 
 def test_progress_output_error_does_not_interrupt_cleanup(
-    make_case, manager, simulated_runtime, monkeypatch
+    make_case, simulated_runtime, monkeypatch
 ):
-    platform, record = manager()
     native_print = print
 
     def fail(*args, **kwargs):
@@ -483,46 +471,42 @@ def test_progress_output_error_does_not_interrupt_cleanup(
         return native_print(*args, **kwargs)
 
     monkeypatch.setattr(runner, "print", fail, raising=False)
-    summary = runner.execute(make_case(*simulated_runtime, "--platform", platform))
+    summary = runner.execute(make_case(*simulated_runtime, "--device", "0,1,2,3"))
     assert summary["status"] == "failed"
     assert summary["cleanup_status"] == "passed"
     assert all(code is not None for code in summary["process_exit_codes"].values())
-    assert record.exists() and summary["lease_released"]
     assert any("closed progress stream" in error for error in summary["errors"])
 
 
 @pytest.mark.parametrize("stage", ["build_services", "wait_ready"])
-def test_cancel_after_allocation_releases_lease(
-    make_case, manager, simulated_runtime, monkeypatch, stage
+def test_cancel_during_startup_cleans_up_children(
+    make_case, simulated_runtime, monkeypatch, stage
 ):
-    platform, record = manager()
-
     def cancel(*_args):
         raise KeyboardInterrupt("cancelled test")
 
     monkeypatch.setattr(runner, stage, cancel)
-    summary = runner.execute(make_case(*simulated_runtime, "--platform", platform))
+    summary = runner.execute(make_case(*simulated_runtime, "--device", "0,1,2,3"))
     assert summary["status"] == "cancelled"
-    assert record.exists()
-    assert summary["lease_released"]
+    assert summary["cleanup_status"] == "passed"
     assert all(code is not None for code in summary["process_exit_codes"].values())
 
 
-def test_survivors_retain_manager_lease(
-    make_case, manager, simulated_runtime, monkeypatch
+def test_surviving_owned_processes_fail_cleanup(
+    make_case, simulated_runtime, monkeypatch
 ):
-    platform, record = manager()
     monkeypatch.setattr(
         runner,
         "find_processes_matching_environment",
         lambda *_: [type("Identity", (), {"pid": 123})()],
     )
     monkeypatch.setattr(runner, "close_process_identities", lambda *_: None)
-    summary = runner.execute(make_case(*simulated_runtime, "--platform", platform))
+    summary = runner.execute(make_case(*simulated_runtime, "--device", "0,1,2,3"))
     assert summary["status"] == "failed"
-    assert summary["allocation_retained"]
-    assert summary["failed_stage"] == "release"
-    assert not record.exists()
+    assert summary["cleanup_status"] == "failed"
+    assert summary["failed_stage"] == "cleanup"
+    assert any("Owned processes still alive" in error for error in summary["errors"])
+    assert all(code is not None for code in summary["process_exit_codes"].values())
 
 
 def test_pidfd_cleanup_does_not_kill_other_runs():

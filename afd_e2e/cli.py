@@ -1,4 +1,4 @@
-"""One local entry point, with optional in-Pod device manager commands."""
+"""AFD test entry point with inherited or explicitly selected devices."""
 
 from __future__ import annotations
 
@@ -67,25 +67,10 @@ def parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--devices",
             "--device",
-            help="Comma-separated IDs, e.g. 0,1,2; no platform file required",
-        )
-        sub.add_argument(
-            "--npu-count",
-            type=int,
-            help="Requested device count; defaults to topology size",
-        )
-        sub.add_argument(
-            "--platform",
-            type=Path,
-            help="Optional YAML/JSON device-manager commands, not a Pod manager",
-        )
-        sub.add_argument(
-            "--allocate-command",
-            help="Manager command; {count} and {run_id} placeholders",
-        )
-        sub.add_argument(
-            "--release-command",
-            help="Manager command; {lease_id} and {run_id} placeholders",
+            help=(
+                "Comma-separated IDs; otherwise inherit "
+                "ASCEND_RT_VISIBLE_DEVICES from npu run"
+            ),
         )
         sub.add_argument(
             "--limit", default="30", help="Exact GSM8K sample count or all (1319)"

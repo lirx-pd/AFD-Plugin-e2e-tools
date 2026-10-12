@@ -6,8 +6,7 @@ import json
 
 import pytest
 
-from afd_e2e import cli, config, evaluation
-from afd_e2e.devices import acquire, release
+from afd_e2e import cli, config, evaluation, runner
 from afd_e2e.planner import build_services, describe, runtime_environment
 
 
@@ -92,7 +91,6 @@ def test_v4_layered_layout_and_flags(make_case, ffn_mrv):
             "on",
         ],
         ["--moe-ubatching", "on"],
-        ["--npu-count", "0"],
         ["--limit", "0"],
         ["--limit", "1320"],
         ["--threshold", "nan"],
@@ -128,18 +126,12 @@ def test_native_mrv2_dbo_keeps_ffn_mrv1(make_case):
     assert "--enable-dbo" in ffn.command
 
 
-def test_platform_is_optional_and_sibling_found_from_any_cwd(
-    make_case, monkeypatch, tmp_path
-):
+def test_sibling_found_from_any_cwd(make_case, monkeypatch, tmp_path):
     original = config.default_repo()
     monkeypatch.chdir(tmp_path)
-    assert make_case("--device", "4,5,6,7").repo == original
-    assert acquire(make_case("--device", "4,5,6,7"), "test").devices == (
-        "4",
-        "5",
-        "6",
-        "7",
-    )
+    case = make_case("--device", "4,5,6,7")
+    assert case.repo == original
+    assert case.devices == ("4", "5", "6", "7")
 
 
 def test_inherited_environment_preserved(make_case, monkeypatch):
@@ -170,68 +162,67 @@ def test_service_registers_custom_opp_before_can_initialization(
         ]
 
 
-def test_plan_never_calls_manager(manager, monkeypatch, capsys):
-    platform, record = manager()
+def test_plan_without_devices_keeps_assignment_pending(monkeypatch, capsys):
     monkeypatch.setattr(
-        "afd_e2e.devices.invoke", lambda *args: pytest.fail("allocated during plan")
+        runner, "ManagedProcess", lambda *args: pytest.fail("started during plan")
     )
-    assert cli.main(["plan", "--platform", str(platform)]) == 0
-    assert json.loads(capsys.readouterr().out)["device_assignment_pending"]
-    assert not record.exists()
+    assert cli.main(["plan"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["device_assignment_pending"]
+    assert plan["configuration"]["devices"] is None
+    assert sum(len(service["devices"]) for service in plan["services"]) == 4
 
 
-def test_manager_contract_and_release(make_case, manager):
-    platform, record = manager()
-    case = make_case("--platform", platform)
-    lease = acquire(case, "run-safe")
-    assert lease.devices == ("0", "1", "2", "3")
-    release(case, lease, "run-safe")
-    assert json.loads(record.read_text()) == {
-        "devices": [0, 1, 2, 3],
-        "lease_id": "lease-123",
-        "count": 4,
-        "run_id": "run-safe",
-    }
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("--platform", "platform.json"),
+        ("--allocate-command", "allocate"),
+        ("--release-command", "release"),
+        ("--npu-count", "4"),
+    ],
+)
+def test_removed_device_options_are_cli_errors(option, value):
+    with pytest.raises(SystemExit) as error:
+        cli.main(["plan", option, value])
+    assert error.value.code == 2
 
 
-@pytest.mark.parametrize("mode", ["duplicate", "short", "wrong_type"])
-def test_invalid_manager_devices_release_lease(make_case, manager, mode):
-    platform, record = manager(mode)
-    with pytest.raises(ValueError):
-        acquire(make_case("--platform", platform), "bad-allocation")
-    assert json.loads(record.read_text())["lease_id"] == "lease-123"
+def test_explicit_devices_can_select_inherited_subset(make_case, monkeypatch):
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "4,5,6,7,8,9")
+    case = make_case("--device", "6,4,9,5")
+    assert case.devices == ("6", "4", "9", "5")
+    services = {s.role: s for s in build_services(case, case.devices, "test")}
+    assert services["attention"].devices == ("6", "4")
+    assert services["ffn"].devices == ("9", "5")
 
 
-def test_manager_cannot_expand_inherited_devices(make_case, manager, monkeypatch):
-    platform, record = manager()
-    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "4,5,6,7")
-    with pytest.raises(ValueError, match="outside inherited"):
-        acquire(make_case("--platform", platform), "bad-allocation")
-    assert record.exists()
+@pytest.mark.parametrize("topology,devices", [("2a1f", "0,1"), ("2a2f", "0,1,2")])
+def test_devices_must_cover_topology(make_case, topology, devices):
+    with pytest.raises(ValueError, match="Topology needs"):
+        make_case("--topology", topology, "--device", devices)
 
 
-def test_bad_platform_is_cli_error(tmp_path, capsys):
-    path = tmp_path / "bad.yaml"
-    path.write_text("allocator: [unclosed")
-    assert cli.main(["plan", "--platform", str(path)]) == 2
-    assert "Invalid YAML" in capsys.readouterr().err
+def test_extra_devices_are_unused(make_case):
+    case = make_case("--device", "4,5,6,7,8")
+    plan = describe(case)
+    assert plan["unused_devices"] == ("8",)
+    services = {s.role: s for s in build_services(case, case.devices, "test")}
+    assert services["attention"].devices == ("4", "5")
+    assert services["ffn"].devices == ("6", "7")
+
+
+def test_run_without_devices_fails_before_creating_output(make_case, tmp_path):
+    case = make_case("--repo", tmp_path, "--output", tmp_path / "run")
+    with pytest.raises(ValueError, match=r"--device.*npu run|npu run.*--device"):
+        runner.execute(case)
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("value", [None, 3, {}, [True], [1, 1], "1,,2", "-1,2", "１,2"])
 def test_device_response_boundary(value):
     with pytest.raises(ValueError):
         config.parse_devices(value)
-
-
-def test_yaml_and_json_platform_equivalent(tmp_path, make_case):
-    yaml = tmp_path / "p.yaml"
-    yaml.write_text(
-        "allocator:\n  allocate: 'allocator --count {count}'\n  release: 'allocator --release {lease_id}'\n"
-    )
-    case = make_case("--platform", yaml)
-    assert case.allocator.allocate == ("allocator", "--count", "{count}")
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        make_case("--platform", yaml, "--device", "0,1,2,3")
 
 
 def test_async_dbo_is_enabled_only_on_attention(make_case):

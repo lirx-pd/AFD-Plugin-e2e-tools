@@ -2,36 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import math
 import os
-import shlex
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 FULL_GSM8K_COUNT = 1319
 TOOL_ROOT = Path(__file__).resolve().parents[1]
-
-
-def load_mapping(path: Path) -> dict:
-    text = path.read_text(encoding="utf-8")
-    if path.suffix == ".json":
-        value = json.loads(text)
-    else:
-        try:
-            import yaml
-        except ImportError as exc:
-            raise ValueError(
-                "YAML needs PyYAML; use JSON or install afd-e2e[yaml]"
-            ) from exc
-        try:
-            value = yaml.safe_load(text)
-        except yaml.YAMLError as exc:
-            raise ValueError(f"Invalid YAML in {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ValueError(f"Expected a mapping in {path}")
-    return value
 
 
 def parse_devices(value: str | list) -> tuple[str, ...]:
@@ -51,17 +29,6 @@ def parse_devices(value: str | list) -> tuple[str, ...]:
     return devices
 
 
-def command_tokens(value: str | list | None) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if not isinstance(value, (str, list)):
-        raise ValueError("Manager commands must be a command string or string list")
-    tokens = shlex.split(value) if isinstance(value, str) else value
-    if not tokens or any(not isinstance(token, str) for token in tokens):
-        raise ValueError("Manager commands must be a command string or string list")
-    return tuple(tokens)
-
-
 def default_repo() -> Path:
     candidates = (
         TOOL_ROOT.parent / "afd-plugin",
@@ -72,13 +39,6 @@ def default_repo() -> Path:
         (p.resolve() for p in candidates if (p / "afd_plugin").is_dir()),
         candidates[0].resolve(),
     )
-
-
-@dataclass(frozen=True)
-class AllocatorConfig:
-    allocate: tuple[str, ...] = ()
-    release: tuple[str, ...] = ()
-    timeout: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -154,8 +114,6 @@ class Case:
     layered_gmm: bool
     moe_ubatching: bool
     devices: tuple[str, ...] | None
-    npu_count: int
-    allocator: AllocatorConfig
     limit: int
     test: str
     performance: PerformanceConfig
@@ -241,31 +199,7 @@ class Case:
         return result
 
 
-def device_configuration(args) -> tuple[AllocatorConfig, tuple[str, ...] | None]:
-    platform = load_mapping(args.platform) if args.platform else {}
-    unknown = set(platform) - {"allocator"}
-    if unknown:
-        raise ValueError(
-            f"Platform configuration only accepts allocator; unknown: {sorted(unknown)}"
-        )
-    manager = platform.get("allocator", {})
-    if not isinstance(manager, dict) or set(manager) - {
-        "allocate",
-        "release",
-        "timeout",
-    }:
-        raise ValueError("allocator accepts allocate, release, timeout")
-    allocator = AllocatorConfig(
-        command_tokens(args.allocate_command or manager.get("allocate")),
-        command_tokens(args.release_command or manager.get("release")),
-        float(manager.get("timeout", 120)),
-    )
-    if bool(allocator.allocate) != bool(allocator.release):
-        raise ValueError("Supply both allocation and release commands")
-    if args.platform and not allocator.allocate:
-        raise ValueError("--platform must contain an allocator")
-    if args.devices is not None and allocator.allocate:
-        raise ValueError("--devices and a device allocator are mutually exclusive")
+def device_configuration(args) -> tuple[str, ...] | None:
     devices = parse_devices(args.devices) if args.devices is not None else None
     inherited = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
     if (
@@ -276,13 +210,13 @@ def device_configuration(args) -> tuple[AllocatorConfig, tuple[str, ...] | None]
         raise ValueError(
             "Requested devices are outside inherited ASCEND_RT_VISIBLE_DEVICES"
         )
-    if devices is None and not allocator.allocate:
+    if devices is None:
         devices = parse_devices(inherited) if inherited else None
-    return allocator, devices
+    return devices
 
 
 def from_args(args) -> Case:
-    allocator, devices = device_configuration(args)
+    devices = device_configuration(args)
     model_path = args.model_path
     if model_path is None:
         if args.model == "v4-flash":
@@ -295,16 +229,6 @@ def from_args(args) -> Case:
     limit = FULL_GSM8K_COUNT if args.limit == "all" else int(args.limit)
     async_mode = args.comm == "async"
     v4 = args.model == "v4-flash"
-    if args.baseline:
-        required = 4
-    elif v4:
-        required = 16
-    else:
-        required = 3 if topology == "2a1f" else 4
-    npu_count = args.npu_count
-    if npu_count is None:
-        npu_count = len(devices) if devices else required
-
     if v4 and async_mode:
         default_model_len, default_batched_tokens = 65536, 32768
     elif v4:
@@ -331,8 +255,6 @@ def from_args(args) -> Case:
             args.moe_ubatching == "on" if args.moe_ubatching else async_mode
         ),
         devices=devices,
-        npu_count=npu_count,
-        allocator=allocator,
         limit=limit,
         test=args.test,
         performance=performance_configuration(args),
@@ -411,12 +333,11 @@ def validate(case: Case) -> None:
         raise ValueError(
             "Current Layered GMM requires V4, async, eager and dynamicQuant=1"
         )
-    if case.npu_count < case.required_devices:
+    if case.devices is not None and len(case.devices) < case.required_devices:
         raise ValueError(
-            f"Topology needs {case.required_devices} devices; requested {case.npu_count}"
+            f"Topology needs {case.required_devices} devices; "
+            f"received {len(case.devices)}"
         )
-    if case.devices is not None and len(case.devices) != case.npu_count:
-        raise ValueError("--npu-count must equal the number of supplied devices")
     if not 1 <= case.limit <= FULL_GSM8K_COUNT:
         raise ValueError(f"--limit must be in 1..{FULL_GSM8K_COUNT}, or all")
     for name in (
@@ -445,8 +366,6 @@ def validate(case: Case) -> None:
         or not 0 < case.memory_utilization < 1
     ):
         raise ValueError("memory-utilization must be in (0, 1)")
-    if not math.isfinite(case.allocator.timeout) or case.allocator.timeout <= 0:
-        raise ValueError("Allocator timeout must be positive and finite")
     if not case.capture_sizes or any(size <= 0 for size in case.capture_sizes):
         raise ValueError("capture-sizes must contain positive integers")
     if case.execution == "graph" and max(case.capture_sizes) < case.max_seqs:
