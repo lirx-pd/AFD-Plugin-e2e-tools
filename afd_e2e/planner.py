@@ -1,0 +1,355 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
+# SPDX-License-Identifier: Apache-2.0
+"""Build runtime commands without importing torch, vLLM, or repository tests."""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import socket
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+
+from .config import TOOL_ROOT, Case
+
+
+@dataclass(frozen=True)
+class Service:
+    role: str
+    devices: tuple[str, ...]
+    command: tuple[str, ...]
+    environment: dict[str, str]
+
+    def to_dict(self) -> dict:
+        return {
+            "role": self.role,
+            "devices": self.devices,
+            "command": self.command,
+            "environment": self.environment,
+        }
+
+
+def network(case: Case) -> tuple[str, str | None]:
+    interface = case.nic or os.environ.get("HCCL_SOCKET_IFNAME")
+    address = case.afd_host or os.environ.get("HCCL_IF_IP")
+    if interface is None:
+        try:
+            for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+                values = line.split()
+                if values[1] == "00000000" and int(values[3], 16) & 2:
+                    interface = values[0]
+                    break
+        except (OSError, IndexError, ValueError):
+            pass
+    if address is None and interface:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                value = fcntl.ioctl(
+                    sock.fileno(), 0x8915, struct.pack("256s", interface.encode()[:15])
+                )
+            address = socket.inet_ntoa(value[20:24])
+        except OSError:
+            pass
+    return address or "127.0.0.1", interface
+
+
+def environment(
+    case: Case, role: str, devices: tuple[str, ...], run_id: str
+) -> dict[str, str]:
+    address, interface = network(case)
+    env = {
+        "PYTHONUNBUFFERED": "1",
+        "VLLM_USE_V1": "1",
+        "VLLM_PLUGINS": "ascend" if case.baseline else "ascend,afd",
+        "VLLM_USE_V2_MODEL_RUNNER": str(
+            int((case.ffn_mrv if role == "ffn" else case.mrv) == "mrv2")
+        ),
+        "ASCEND_RT_VISIBLE_DEVICES": ",".join(devices),
+        "AFD_E2E_RUN_ID": run_id,
+        "AFD_E2E_PROCESS_ROLE": role,
+        "AFD_E2E_LAYERED_EXPECTED": str(int(case.layered_gmm and role == "ffn")),
+        "AFD_ASYNC_CAM_LAYERED_GMM": str(int(case.layered_gmm and role == "ffn")),
+        "PYTHONPATH": os.pathsep.join(
+            filter(None, (str(case.repo), str(TOOL_ROOT), os.environ.get("PYTHONPATH")))
+        ),
+        "PYTORCH_NPU_ALLOC_CONF": os.environ.get(
+            "PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True"
+        ),
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        "AFD_FORCE_SPAWN_MULTIPROCESSING": "1",
+        "HCCL_IF_IP": address,
+        "HCCL_CONNECT_TIMEOUT": "1200",
+        "HCCL_EXEC_TIMEOUT": "2000",
+        "VLLM_RPC_TIMEOUT": "3600000",
+        "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "30000",
+        "VLLM_ENGINE_READY_TIMEOUT_S": str(int(case.startup_timeout)),
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "10"),
+        "OMP_PROC_BIND": "false",
+        "AFD_FORCE_BALANCED_TOPK_IDS": "0",
+        "AFD_CAM_OP_IO_LOG": "0",
+        "AFD_ASYNC_MOE_LAYOUT_LOG": "0",
+    }
+    if interface:
+        env.update(
+            {
+                name: interface
+                for name in (
+                    "HCCL_SOCKET_IFNAME",
+                    "GLOO_SOCKET_IFNAME",
+                    "TP_SOCKET_IFNAME",
+                )
+            }
+        )
+    if case.comm == "async":
+        env.update(
+            {
+                "HCCL_BUFFSIZE": "4096",
+                "HCCL_OP_EXPANSION_MODE": "AIV",
+                "TASK_QUEUE_ENABLE": "1",
+            }
+        )
+    if case.dbo:
+        env["VLLM_LOGGING_LEVEL"] = "DEBUG"
+    vendor = case.repo / "afd_plugin/_cann_ops_custom/vendors/afd-plugin"
+    if not case.baseline and vendor.is_dir():
+        # CANN caches operator configurations during its first initialization.
+        # The connector's later loader cannot make Layered GMM visible then.
+        env["ASCEND_CUSTOM_OPP_PATH"] = os.pathsep.join(
+            filter(None, (str(vendor), os.environ.get("ASCEND_CUSTOM_OPP_PATH")))
+        )
+    if case.offline:
+        env.update({"HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1"})
+    return env
+
+
+def runtime_environment(service: Service) -> dict[str, str]:
+    env = os.environ.copy()
+    for name in (
+        "AFD_PLUGIN_EARLY_ENGINE_PATCH",
+        "VLLM_ASCEND_ENABLE_FLASHCOMM1",
+    ):
+        env.pop(name, None)
+    # The sync connector sizes its own domains; do not inherit Async CAM buffers.
+    if "HCCL_BUFFSIZE" not in service.environment:
+        env.pop("HCCL_BUFFSIZE", None)
+    env.update(service.environment)
+    return env
+
+
+def _additional_config(case: Case, role: str, address: str) -> dict:
+    config = {}
+    if not case.baseline:
+        extra = {"hccl_buffer_size": 4096 if case.comm == "async" else 2048}
+        if case.comm == "async":
+            extra.update(
+                {
+                    "dynamicQuant": case.dynamic_quant,
+                    "attn_ranks_per_dp": case.attention_tp,
+                    "async_moe_ubatching": case.moe_ubatching,
+                }
+            )
+        else:
+            extra["quant_mode"] = 0
+        config["afd"] = {
+            "role": role,
+            "connector": "CAMAsyncAFDConnector"
+            if case.comm == "async"
+            else "CAMP2pAFDConnector",
+            "host": address,
+            "port": case.afd_port,
+            "num_attention_ranks": case.attention_ranks,
+            "num_ffn_ranks": case.ffn_ranks,
+            "async": case.comm == "async",
+            "compute_gate_on_attention": case.comm == "async",
+            "connector_extra_config": extra,
+        }
+    if case.model == "v4-flash":
+        config.update(
+            {
+                "enable_flashcomm1": case.comm == "async" and role != "ffn",
+                "enable_cpu_binding": True,
+                "enable_force_eplb": False,
+                "enable_dsa_cp": False,
+                "multistream_dsv4_dsa_overlap": False,
+            }
+        )
+    return config
+
+
+def _service_command(
+    case: Case, role: str, address: str, count: int, tp: int
+) -> tuple[str, ...]:
+    ffn = role == "ffn"
+    config = _additional_config(case, role, address)
+    command = [
+        case.vllm_bin,
+        "serve",
+        case.model_path,
+        "--served-model-name",
+        f"afd-e2e-{role}",
+        "--host",
+        case.api_host,
+        "--port",
+        str(case.api_port + int(ffn)),
+        "--shutdown-timeout",
+        "10",
+        "--data-parallel-size",
+        str(count // tp),
+        "--tensor-parallel-size",
+        str(tp),
+        "--enable-expert-parallel",
+        "--max-model-len",
+        str(case.max_model_len),
+        "--max-num-batched-tokens",
+        str(case.max_batched_tokens),
+        "--max-num-seqs",
+        str(case.max_seqs),
+        "--gpu-memory-utilization",
+        str(case.memory_utilization),
+        "--seed",
+        "42",
+        "--trust-remote-code",
+        "--no-enable-prefix-caching",
+        "--no-async-scheduling",
+        "--enable-chunked-prefill",
+    ]
+    if config:
+        command.extend(
+            ("--additional-config", json.dumps(config, separators=(",", ":")))
+        )
+    if not case.baseline:
+        command.extend(("--worker-extension-cls", "afd_e2e.observer.Worker"))
+    if case.execution == "eager":
+        command.append("--enforce-eager")
+    else:
+        command.extend(
+            (
+                "--compilation-config",
+                json.dumps(
+                    {
+                        "cudagraph_mode": "FULL_DECODE_ONLY",
+                        "cudagraph_capture_sizes": case.capture_sizes,
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+    native_dbo = case.dbo or (case.comm == "async" and case.moe_ubatching)
+    if native_dbo and (case.comm != "async" or role == "attention"):
+        if case.dbo:
+            command.append("--enable-dbo")
+        command.extend(
+            (
+                "--dbo-decode-token-threshold",
+                "2",
+                "--dbo-prefill-token-threshold",
+                "8",
+            )
+        )
+    if case.model == "v4-flash":
+        command.extend(
+            (
+                "--block-size",
+                "128",
+                "--quantization",
+                "ascend",
+                "--attention_config.indexer_kv_dtype",
+                "int8",
+                "--tokenizer-mode",
+                "deepseek_v4",
+                "--model-loader-extra-config",
+                '{"enable_multithread_load":true,"num_threads":128}',
+            )
+        )
+        if not ffn:
+            command.extend(
+                (
+                    "--data-parallel-address",
+                    address,
+                    "--tool-call-parser",
+                    "deepseek_v4",
+                    "--enable-auto-tool-choice",
+                    "--reasoning-parser",
+                    "deepseek_v4",
+                    "--no-disable-hybrid-kv-cache-manager",
+                )
+            )
+    if case.comm == "async":
+        command.extend(
+            (
+                "--all2all-backend",
+                "flashinfer_all2allv" if ffn else "allgather_reducescatter",
+            )
+        )
+    command.extend(case.common_args)
+    command.extend(case.ffn_args if ffn else case.attention_args)
+    return tuple(command)
+
+
+def build_services(
+    case: Case, devices: tuple[str, ...], run_id: str
+) -> tuple[Service, ...]:
+    if len(devices) < case.required_devices:
+        raise ValueError("Not enough assigned devices")
+    address, _ = network(case)
+    if case.baseline:
+        roles = ("baseline",)
+    elif case.comm == "async":
+        roles = ("attention", "ffn")
+    else:
+        roles = ("ffn", "attention")
+    services = []
+    for role in roles:
+        ffn = role == "ffn"
+        count = case.ffn_ranks if ffn else case.attention_ranks
+        assigned = (
+            devices[case.attention_ranks : case.required_devices]
+            if ffn
+            else devices[: case.attention_ranks]
+        )
+        tp = 1 if ffn else case.attention_tp
+        services.append(
+            Service(
+                role,
+                assigned,
+                _service_command(case, role, address, count, tp),
+                environment(case, role, assigned, run_id),
+            )
+        )
+    return tuple(services)
+
+
+def describe(case: Case) -> dict:
+    from .performance import points
+
+    devices = case.devices or tuple(str(index) for index in range(case.npu_count))
+    return {
+        "configuration": case.to_dict(),
+        "device_assignment_pending": case.devices is None,
+        "attention": {
+            "ranks": case.attention_ranks,
+            "dp": case.attention_ranks // case.attention_tp,
+            "tp": case.attention_tp,
+        },
+        "ffn": {
+            "ranks": case.ffn_ranks,
+            "dp": case.ffn_ranks,
+            "tp": 1,
+            "ep": case.ffn_ranks,
+        },
+        "services": [
+            service.to_dict() for service in build_services(case, devices, "PLAN-ONLY")
+        ],
+        "unused_devices": devices[case.required_devices :],
+        "performance_points": points(case.to_dict()["performance"])
+        if case.test == "perf"
+        else [],
+        "notes": [
+            "plan does not allocate devices or start services",
+            "NPU FFN uses AFDNPUFFNModelRunner for both MRV flags; coverage checks the flag and actual Layered GMM calls",
+        ],
+    }

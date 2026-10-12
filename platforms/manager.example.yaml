@@ -1,0 +1,6 @@
+# 替换为当前平台 Pod 内的设备管理命令；此文件不参与默认行为。
+# 命令接收 stdin JSON，申请命令 stdout 返回 lease_id 和 devices。
+allocator:
+  allocate: [python3, /opt/platform/allocate.py, --count, "{count}"]
+  release: [python3, /opt/platform/release.py, --lease-id, "{lease_id}"]
+  timeout: 120
