@@ -15,6 +15,7 @@ work/
 
 使用 Python 3.10+，以及已经安装 CANN、torch-npu、vLLM、vLLM-Ascend 和 `afd-plugin` 的推理环境；
 自定义 CAM / Layered 算子须在该环境编译安装。工具不改动插件源码。
+原生 `--baseline` 只需要现有 vLLM-Ascend 推理环境，不要求安装 `afd-plugin` 或 CAM 算子。
 只查看启动方案无需安装推理或评测依赖：
 
 ```bash
@@ -39,8 +40,9 @@ python -m pip install -e '.[eval]'
 ## 设备管理与启动
 
 支持 `npu run` 申请设备后启动，以及 `--device` 使用已分配设备两种方式。
-设备列表按顺序切分给 Attention 和 FFN：V2 的 2A1F 需要 3 张，2A2F 和原生
-baseline 需要 4 张；V4 需要 16 张。超出拓扑所需的设备不使用。
+AFD 设备列表按顺序切分给 Attention 和 FFN：V2 的 2A1F 需要 3 张，2A2F 需要
+4 张；V4 AFD 需要 16 张。原生 baseline 按实例顺序切分，每实例使用 DP × TP
+张设备，合计为所有实例之和。超出拓扑所需的设备不使用。
 
 ### 使用 npu run
 
@@ -100,7 +102,7 @@ python run.py run --device 0,1,2,3 --topology 2a2f --test smoke
 | `--repo` | 待测 `afd-plugin` 路径，默认优先寻找工具同级目录 |
 | `--comm` | `sync` / `async`，默认 sync |
 | `--model` | `v2-lite` / `v4-flash`，默认 V2；V4 必须指定权重路径 |
-| `--topology` | V2：`2a1f` / `2a2f`（默认）；V4：自动 `dp2tp4-ep8` |
+| `--topology` | AFD：V2 `2a1f` / `2a2f`；V4 `dp2tp4-ep8`。baseline：`dpN` 或 `dpNtpM`，多个实例用逗号分隔 |
 | `--mrv` | `mrv1` / `mrv2`，默认 mrv1，应用于双侧 |
 | `--ffn-mrv` | 可单独覆盖 FFN 的 MRV 选择 |
 | `--dbo` | 原生 vLLM DBO：`on` / `off`，默认 off |
@@ -108,7 +110,7 @@ python run.py run --device 0,1,2,3 --topology 2a2f --test smoke
 | `--moe-ubatching` | Async CAM 两段 token 拆分：`on` / `off`，异步默认 on |
 | `--execution` | `eager` / `graph`，默认 eager |
 | `--limit` | GSM8K 条数 `1..1319`，默认 30；`all` 为 1319 |
-| `--test` | `smoke` / `gsm8k` / `all` / `perf`，默认 all；all 仍是 smoke + GSM8K |
+| `--test` | `smoke` / `gsm8k` / `all` / `perf`；AFD 默认 all（smoke + GSM8K），baseline 默认 perf |
 | `--device` / `--devices` | 逗号分隔的设备编号；也可继承 `ASCEND_RT_VISIBLE_DEVICES` |
 
 ### 功能组合限制
@@ -126,7 +128,56 @@ MRV2 DBO 的覆盖检查还要求每个 Attention rank 记录真实 `NPUUBatchRu
 `--moe-ubatching` 对应异步 CAM 自身的拆分机制，不能用原生 DBO 开关替代。
 比较 MRV2 的 DBO on / off 时，两组均显式设置 `--moe-ubatching off`，只改变 `--dbo`；
 否则异步默认开启的拆分仍会触发双微批。Async DBO 只在 Attention 开启原生 DBO，FFN 消费 CAM 工作项。
-`--baseline` 保留仓库中原生 V2 Lite 的 4 卡基线测试。
+`--baseline` 使用原生 vLLM-Ascend，支持下面的 DP 实例组合，默认进行性能测试。
+
+### 原生 DP 性能基线
+
+复用当前环境和依赖版本，以 `--baseline` 启用；服务不注册 AFD 插件，不传 AFD
+角色配置或 worker extension。支持一个 DP-N 实例和多个不同大小的 DP 实例。
+`dpN` 的默认 TP 为 V2 Lite 的 1、V4 Flash 的 4；也可用 `dpNtpM` 显式指定。
+默认拓扑分别为 `dp4tp1` 和 `dp2tp4`。原生 MoE 服务沿用 `--enable-expert-parallel`。
+
+```bash
+# Single DP4 instance, TP1: four devices.
+python run.py plan --baseline --topology dp4
+
+# Two DP2/TP4 instances: sixteen devices, matching the two-EP8 HTTP layout.
+python run.py plan --baseline --model v4-flash --model-path "$V4_MODEL" \
+  --topology dp2,dp2
+
+# Four DP1/TP4 instances: sixteen devices, matching the four-EP4 HTTP layout.
+python run.py plan --baseline --model v4-flash --model-path "$V4_MODEL" \
+  --topology dp1,dp1,dp1,dp1
+
+# Mixed DP1/TP4 and DP2/TP4 instances: twelve devices.
+python run.py plan --baseline --model v4-flash --model-path "$V4_MODEL" \
+  --topology dp1tp4,dp2tp4
+
+# Reserve the devices for the complete performance run.
+npu run --gpus 16 --nonblock -- \
+  python run.py run --baseline --model v4-flash --model-path "$V4_MODEL" \
+  --topology dp2,dp2 --perf-concurrencies 1,8,16
+```
+
+各实例使用同一模型、批量设置和性能负载。第 i 个实例监听 `api-port + i`；
+DP RPC 端口从 `api-port + 实例数` 起分配。启动检查等待全部实例就绪。
+请求按序号轮询全局 DP 域列表，选择实例 URL，并设置实例内的
+`X-data-parallel-rank`；当前性能负载是独立单轮请求。全局并发限制沿用性能测试设置。
+
+例如 `dp1,dp3` 的四个域映射为：
+
+| 域 | HTTP 端口 | 实例内 DP rank |
+| --- | --- | --- |
+| 0 | api-port | 0 |
+| 1 | api-port + 1 | 0 |
+| 2 | api-port + 1 | 1 |
+| 3 | api-port + 1 | 2 |
+
+`plan.json` 和运行 manifest 保存域映射，逐请求性能记录保存实际选择的 route。
+预热数大于 0 时，实际预热请求数至少覆盖全部 DP 域，并记录在每个性能点的
+`warmup_requests`；设置 `--perf-warmup 0` 可关闭预热。
+基线可显式运行 `--test smoke`；本次没有扩展 GSM8K 的多实例路由，baseline 不接受
+`--test gsm8k` 或 `--test all`。
 
 ### 网络、内存与批量校准
 

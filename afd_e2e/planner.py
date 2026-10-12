@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import TOOL_ROOT, Case
+from .routing import routes
 
 
 @dataclass(frozen=True)
@@ -64,7 +65,10 @@ def environment(
     env = {
         "PYTHONUNBUFFERED": "1",
         "VLLM_USE_V1": "1",
-        "VLLM_PLUGINS": "ascend" if case.baseline else "ascend,afd",
+        "VLLM_PLUGINS": (
+            "ascend,ascend_model,ascend_model_loader,ascend_kv_connector"
+            if case.baseline else "ascend,afd"
+        ),
         "VLLM_USE_V2_MODEL_RUNNER": str(
             int((case.ffn_mrv if role == "ffn" else case.mrv) == "mrv2")
         ),
@@ -74,7 +78,10 @@ def environment(
         "AFD_E2E_LAYERED_EXPECTED": str(int(case.layered_gmm and role == "ffn")),
         "AFD_ASYNC_CAM_LAYERED_GMM": str(int(case.layered_gmm and role == "ffn")),
         "PYTHONPATH": os.pathsep.join(
-            filter(None, (str(case.repo), str(TOOL_ROOT), os.environ.get("PYTHONPATH")))
+            filter(None, (
+                str(case.repo) if not case.baseline else None,
+                str(TOOL_ROOT), os.environ.get("PYTHONPATH"),
+            ))
         ),
         "PYTORCH_NPU_ALLOC_CONF": os.environ.get(
             "PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True"
@@ -181,7 +188,7 @@ def _additional_config(case: Case, role: str, address: str) -> dict:
 
 
 def _service_command(
-    case: Case, role: str, address: str, count: int, tp: int
+    case: Case, role: str, address: str, count: int, tp: int, instance: int = 0
 ) -> tuple[str, ...]:
     ffn = role == "ffn"
     config = _additional_config(case, role, address)
@@ -194,7 +201,7 @@ def _service_command(
         "--host",
         case.api_host,
         "--port",
-        str(case.api_port + int(ffn)),
+        str(case.api_port + (instance if case.baseline else int(ffn))),
         "--shutdown-timeout",
         "10",
         "--data-parallel-size",
@@ -217,6 +224,11 @@ def _service_command(
         "--no-async-scheduling",
         "--enable-chunked-prefill",
     ]
+    if case.baseline:
+        command.extend((
+            "--data-parallel-rpc-port",
+            str(case.api_port + len(case.baseline_layouts) + instance),
+        ))
     if config:
         command.extend(
             ("--additional-config", json.dumps(config, separators=(",", ":")))
@@ -297,8 +309,19 @@ def build_services(
         raise ValueError("Not enough assigned devices")
     address, _ = network(case)
     if case.baseline:
-        roles = ("baseline",)
-    elif case.comm == "async":
+        services = []
+        offset = 0
+        for instance, (dp, tp) in enumerate(case.baseline_layouts):
+            assigned = devices[offset : offset + dp * tp]
+            role = f"baseline-{instance}"
+            services.append(Service(
+                role, assigned,
+                _service_command(case, "baseline", address, dp * tp, tp, instance),
+                environment(case, role, assigned, run_id),
+            ))
+            offset += dp * tp
+        return tuple(services)
+    if case.comm == "async":
         roles = ("attention", "ffn")
     else:
         roles = ("ffn", "attention")
@@ -327,20 +350,10 @@ def describe(case: Case) -> dict:
     from .performance import points
 
     devices = case.devices or tuple(str(i) for i in range(case.required_devices))
-    return {
+    result = {
         "configuration": case.to_dict(),
         "device_assignment_pending": case.devices is None,
-        "attention": {
-            "ranks": case.attention_ranks,
-            "dp": case.attention_ranks // case.attention_tp,
-            "tp": case.attention_tp,
-        },
-        "ffn": {
-            "ranks": case.ffn_ranks,
-            "dp": case.ffn_ranks,
-            "tp": 1,
-            "ep": case.ffn_ranks,
-        },
+        "routes": routes(case.to_dict()),
         "services": [
             service.to_dict() for service in build_services(case, devices, "PLAN-ONLY")
         ],
@@ -350,6 +363,22 @@ def describe(case: Case) -> dict:
         else [],
         "notes": [
             "plan does not allocate devices or start services",
-            "NPU FFN uses AFDNPUFFNModelRunner for both MRV flags; coverage checks the flag and actual Layered GMM calls",
         ],
     }
+    if case.baseline:
+        result["native_instances"] = [
+            {"instance": i, "dp": dp, "tp": tp, "ep": dp * tp}
+            for i, (dp, tp) in enumerate(case.baseline_layouts)
+        ]
+    else:
+        result.update(
+            attention={"ranks": case.attention_ranks,
+                       "dp": case.attention_ranks // case.attention_tp,
+                       "tp": case.attention_tp},
+            ffn={"ranks": case.ffn_ranks, "dp": case.ffn_ranks,
+                 "tp": 1, "ep": case.ffn_ranks},
+        )
+        result["notes"].append(
+            "NPU FFN uses AFDNPUFFNModelRunner for both MRV flags; coverage checks the flag and actual Layered GMM calls"
+        )
+    return result

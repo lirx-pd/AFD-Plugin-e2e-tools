@@ -156,6 +156,7 @@ def test_stream_uses_token_count_not_chunk_count_and_ignores_control_events(
                 "http://test/v1/completions",
                 {"prompt": [1] * 8, "max_tokens": 4},
                 record,
+                {},
             )
             return record
 
@@ -186,6 +187,7 @@ def test_one_special_token_has_ttft_but_no_tpot():
                 "http://test/v1/completions",
                 {"prompt": [1], "max_tokens": 1},
                 record,
+                {},
             )
             return record
 
@@ -232,6 +234,7 @@ def test_invalid_stream_cannot_supply_successful_metrics(fault):
                     "http://test/v1/completions",
                     {"prompt": [1] * 8, "max_tokens": 4},
                     record,
+                    {},
                 )
             assert record.get("status") != "passed"
 
@@ -281,7 +284,7 @@ def test_concurrency_cap_and_queue_time_do_not_inflate_ttft(make_case):
             records, raw, state = [], io.StringIO(), {}
             await performance.batch(
                 client,
-                "http://test/v1/completions",
+                [{"url": "http://test", "headers": {}}],
                 "model",
                 [1, 2, 3],
                 point,
@@ -331,7 +334,7 @@ def test_total_request_timeout_survives_regular_stream_activity(make_case):
             records, raw = [], io.StringIO()
             await performance.batch(
                 client,
-                "http://test/v1/completions",
+                [{"url": "http://test", "headers": {}}],
                 "model",
                 [1, 2],
                 point,
@@ -382,7 +385,7 @@ def test_cancellation_preserves_raw_request_and_stops_inflight_work(make_case):
             task = asyncio.create_task(
                 performance.batch(
                     client,
-                    "http://test/v1/completions",
+                    [{"url": "http://test", "headers": {}}],
                     "model",
                     [1, 2],
                     point,

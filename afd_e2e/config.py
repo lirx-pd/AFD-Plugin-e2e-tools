@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -39,6 +40,17 @@ def default_repo() -> Path:
         (p.resolve() for p in candidates if (p / "afd_plugin").is_dir()),
         candidates[0].resolve(),
     )
+
+
+def baseline_layouts(topology: str, model: str) -> tuple[tuple[int, int], ...]:
+    layouts = []
+    for item in topology.split(","):
+        match = re.fullmatch(r"dp([1-9][0-9]*)(?:tp([1-9][0-9]*))?", item.strip())
+        if match is None:
+            raise ValueError("Baseline topology requires dpN or dpNtpM, comma-separated")
+        dp, tp = match.groups()
+        layouts.append((int(dp), int(tp) if tp else (4 if model == "v4-flash" else 1)))
+    return tuple(layouts)
 
 
 @dataclass(frozen=True)
@@ -149,7 +161,7 @@ class Case:
     @property
     def attention_ranks(self) -> int:
         if self.baseline:
-            return 4
+            return sum(dp * tp for dp, tp in self.baseline_layouts)
         return 8 if self.model == "v4-flash" else 2
 
     @property
@@ -167,7 +179,7 @@ class Case:
     @property
     def attention_tp(self) -> int:
         if self.baseline:
-            return 1
+            return self.baseline_layouts[0][1]
         if self.model == "v4-flash":
             return 4
         return 2 if self.comm == "async" else 1
@@ -175,7 +187,7 @@ class Case:
     @property
     def case_id(self) -> str:
         if self.baseline:
-            return f"{self.model}-baseline-{self.execution}"
+            return f"{self.model}-baseline-{self.topology}-{self.mrv}-{self.execution}"
         return "-".join(
             (
                 self.model,
@@ -189,6 +201,10 @@ class Case:
                 f"layered-{int(self.layered_gmm)}",
             )
         )
+
+    @property
+    def baseline_layouts(self) -> tuple[tuple[int, int], ...]:
+        return baseline_layouts(self.topology, self.model)
 
     def to_dict(self) -> dict:
         result = asdict(self)
@@ -225,7 +241,10 @@ def from_args(args) -> Case:
     local_model = Path(model_path).expanduser()
     if local_model.exists() or model_path.startswith(("/", ".", "~")):
         model_path = str(local_model.resolve())
-    topology = args.topology or ("dp2tp4-ep8" if args.model == "v4-flash" else "2a2f")
+    if args.baseline:
+        topology = args.topology or ("dp2tp4" if args.model == "v4-flash" else "dp4tp1")
+    else:
+        topology = args.topology or ("dp2tp4-ep8" if args.model == "v4-flash" else "2a2f")
     limit = FULL_GSM8K_COUNT if args.limit == "all" else int(args.limit)
     async_mode = args.comm == "async"
     v4 = args.model == "v4-flash"
@@ -256,7 +275,7 @@ def from_args(args) -> Case:
         ),
         devices=devices,
         limit=limit,
-        test=args.test,
+        test=args.test or ("perf" if args.baseline else "all"),
         performance=performance_configuration(args),
         dataset_path=args.dataset_path.resolve() if args.dataset_path else None,
         threshold=args.threshold,
@@ -302,20 +321,22 @@ def validate(case: Case) -> None:
         > case.max_model_len
     ):
         raise ValueError("Performance input + output length exceeds --max-model-len")
-    if case.model == "v2-lite" and case.topology not in {"2a1f", "2a2f"}:
+    if not case.baseline and case.model == "v2-lite" and case.topology not in {"2a1f", "2a2f"}:
         raise ValueError("v2-lite supports 2a1f and 2a2f")
-    if case.model == "v4-flash" and case.topology != "dp2tp4-ep8":
+    if not case.baseline and case.model == "v4-flash" and case.topology != "dp2tp4-ep8":
         raise ValueError("v4-flash requires Attention DP2/TP4 + FFN DP8/TP1/EP8")
     if case.baseline and (
-        case.model != "v2-lite"
-        or case.comm != "sync"
+        case.comm != "sync"
         or case.dbo
         or case.layered_gmm
         or case.moe_ubatching
     ):
         raise ValueError(
-            "Baseline is a V2-Lite native synchronous case without AFD features"
+            "Baseline uses native vLLM-Ascend without AFD communication or splitting"
         )
+    if case.baseline:
+        if case.test not in {"perf", "smoke"}:
+            raise ValueError("Baseline supports perf and smoke; GSM8K routing is not enabled")
     if case.comm == "async" and case.execution != "eager":
         raise ValueError("Async CAM requires eager execution")
     if case.comm == "sync" and case.moe_ubatching:
@@ -372,11 +393,11 @@ def validate(case: Case) -> None:
         raise ValueError("Largest graph capture size must cover max-seqs")
     if case.comm == "async" and case.max_batched_tokens % case.attention_tp:
         raise ValueError("Async max-batched-tokens must be divisible by Attention TP")
-    if (
-        not 1 <= case.api_port < 65535
-        or not 1 <= case.afd_port <= 65535
+    port_count = 2 * len(case.baseline_layouts) if case.baseline else 2
+    if not 1 <= case.api_port <= 65536 - port_count or (not case.baseline and (
+        not 1 <= case.afd_port <= 65535
         or case.afd_port in {case.api_port, case.api_port + 1}
-    ):
+    )):
         raise ValueError("API/AFD ports must be distinct and in range")
     reserved = {
         "--host",
@@ -384,6 +405,7 @@ def validate(case: Case) -> None:
         "--served-model-name",
         "--additional-config",
         "--data-parallel-size",
+        "--data-parallel-rpc-port",
         "--tensor-parallel-size",
         "--enable-expert-parallel",
         "--no-enable-expert-parallel",

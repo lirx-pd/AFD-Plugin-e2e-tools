@@ -20,7 +20,7 @@ def service():
     role = os.environ["AFD_E2E_PROCESS_ROLE"]
     dp = int(argument("--data-parallel-size"))
     tp = int(argument("--tensor-parallel-size"))
-    config = json.loads(argument("--additional-config"))
+    config = json.loads(argument("--additional-config")) if "--additional-config" in sys.argv else {}
     activity = Path(os.environ["AFD_E2E_FAKE_ACTIVITY"])
     mrv = os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
     layered = os.environ["AFD_E2E_LAYERED_EXPECTED"] == "1"
@@ -57,9 +57,11 @@ def service():
                 else message,
                 flush=True,
             )
-        split = "--enable-dbo" in sys.argv or config["afd"][
-            "connector_extra_config"
-        ].get("async_moe_ubatching", False)
+        split = "--enable-dbo" in sys.argv or (
+            "afd" in config and config["afd"]["connector_extra_config"].get(
+                "async_moe_ubatching", False
+            )
+        )
         emit(
             "execution",
             phase="live",

@@ -137,6 +137,29 @@ def test_accuracy_failure_still_cleans_up_children(
     assert all(code is not None for code in summary["process_exit_codes"].values())
 
 
+def test_native_multi_instance_performance_lifecycle(make_case, simulated_runtime, tmp_path):
+    case = make_case(
+        *simulated_runtime, "--baseline", "--topology", "dp1,dp2",
+        "--repo", tmp_path / "missing-plugin", "--device", "0,1,2",
+        "--perf-mode", "matrix", "--perf-input-lens", "8",
+        "--perf-output-lens", "4", "--perf-concurrencies", "3",
+        "--perf-requests", "6", "--perf-warmup", "3",
+    )
+    summary = runner.execute(case)
+    assert summary["status"] == "passed", summary["errors"]
+    assert summary["cleanup_status"] == "passed"
+    assert summary["coverage"]["status"] == "not_applicable"
+    assert "gsm8k" not in summary
+    assert {"baseline-0", "baseline-1"} <= summary["process_exit_codes"].keys()
+    manifest = json.loads((case.run_dir / "manifest.json").read_text())
+    assert len(manifest["services"]) == 2 and len(manifest["routes"]) == 3
+    records = [json.loads(line) for line in (
+        case.run_dir / "performance/requests.jsonl"
+    ).read_text().splitlines()]
+    measured = [r for r in records if r["phase"] == "measured"]
+    assert [r["route"]["domain"] for r in measured] == [0, 1, 2, 0, 1, 2]
+
+
 @pytest.mark.parametrize("comm", ["sync", "async"])
 def test_v4_performance_lifecycle_reuses_devices_and_keeps_warmup_separate(
     make_case, simulated_runtime, comm

@@ -9,6 +9,8 @@ import signal
 import time
 from pathlib import Path
 
+from .routing import routes
+
 
 def evaluate(config: dict, kind: str, output: Path) -> None:
     import httpx
@@ -21,10 +23,8 @@ def evaluate(config: dict, kind: str, output: Path) -> None:
     if v4:
         max_tokens = 256
     role = "baseline" if config["baseline"] else "attention"
-    host = config["api_host"]
-    if host == "0.0.0.0":
-        host = "127.0.0.1"
-    url = f"http://{host}:{config['api_port']}/v1/" + (
+    endpoints = routes(config)
+    path = "/v1/" + (
         "chat/completions" if v4 else "completions"
     )
     check_answer = smoke and v4
@@ -41,6 +41,8 @@ def evaluate(config: dict, kind: str, output: Path) -> None:
             async def request(item):
                 async with semaphore:
                     index = item["index"]
+                    route = endpoints[index % len(endpoints)]
+                    item["route"] = route
                     prompt = f"Compute {12 + index} + 7. Reply with just the number."
                     if not smoke:
                         prompt = (
@@ -63,7 +65,9 @@ def evaluate(config: dict, kind: str, output: Path) -> None:
                     else:
                         body["prompt"] = f"Question: {prompt}\nAnswer:"
                     try:
-                        response = await client.post(url, json=body)
+                        response = await client.post(
+                            route["url"] + path, json=body, headers=route["headers"]
+                        )
                         item["status_code"] = response.status_code
                         item["response_body"] = response.text
                         response.raise_for_status()

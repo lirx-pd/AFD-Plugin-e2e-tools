@@ -19,25 +19,30 @@ def check_ports(host: str, ports: tuple[int, ...]) -> None:
 
 
 def probe(args) -> dict:
-    check_ports(args.api_host, (args.api_port, args.api_port + 1, args.afd_port))
+    check_ports(args.api_host, tuple(args.ports) if args.ports else (
+        args.api_port, args.api_port + 1, args.afd_port
+    ))
     if args.nic:
         socket.if_nametoindex(args.nic)
     import torch
     import torch_npu  # noqa: F401
     import vllm
     import vllm_ascend  # noqa: F401
-    import afd_plugin
+    afd_source = None
+    if not args.baseline:
+        import afd_plugin
 
-    repo = Path(args.repo).resolve()
-    if not Path(afd_plugin.__file__).resolve().is_relative_to(repo):
-        raise RuntimeError(
-            f"Wrong afd_plugin source: {afd_plugin.__file__}; expected {repo}"
-        )
-    plugins = importlib.metadata.entry_points(group="vllm.general_plugins")
-    if not args.baseline and not any(entry.name == "afd" for entry in plugins):
-        raise RuntimeError(
-            "afd-plugin entry point missing; install/build the sibling afd-plugin in the target environment"
-        )
+        repo = Path(args.repo).resolve()
+        if not Path(afd_plugin.__file__).resolve().is_relative_to(repo):
+            raise RuntimeError(
+                f"Wrong afd_plugin source: {afd_plugin.__file__}; expected {repo}"
+            )
+        plugins = importlib.metadata.entry_points(group="vllm.general_plugins")
+        if not any(entry.name == "afd" for entry in plugins):
+            raise RuntimeError(
+                "afd-plugin entry point missing; install/build the sibling afd-plugin in the target environment"
+            )
+        afd_source = afd_plugin.__file__
     if not torch.npu.is_available():
         raise RuntimeError("NPU unavailable")
     requested = len(args.devices.split(","))
@@ -120,7 +125,7 @@ def probe(args) -> dict:
     return {
         "versions": versions,
         "vllm_source": vllm.__file__,
-        "afd_source": afd_plugin.__file__,
+        "afd_source": afd_source,
         "model_type": config["model_type"],
         "layers": config.get("num_hidden_layers"),
         "weight_shards": len(shards),
@@ -139,6 +144,7 @@ def main() -> None:
     parser.add_argument("--api-host", required=True)
     parser.add_argument("--api-port", type=int, required=True)
     parser.add_argument("--afd-port", type=int, required=True)
+    parser.add_argument("--ports", type=lambda value: [int(p) for p in value.split(",")])
     parser.add_argument("--nic")
     parser.add_argument("--async-cam", action="store_true")
     parser.add_argument("--layered", action="store_true")

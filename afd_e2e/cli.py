@@ -48,7 +48,10 @@ def parser() -> argparse.ArgumentParser:
             type=Path,
             help="Defaults to afd-plugin beside this tool directory",
         )
-        sub.add_argument("--topology", choices=("2a1f", "2a2f", "dp2tp4-ep8"))
+        sub.add_argument(
+            "--topology",
+            help="AFD layout, or baseline instances: dpN[tpM], comma-separated",
+        )
         sub.add_argument("--comm", choices=("sync", "async"), default="sync")
         sub.add_argument("--mrv", choices=("mrv1", "mrv2"), default="mrv1")
         sub.add_argument(
@@ -76,7 +79,8 @@ def parser() -> argparse.ArgumentParser:
             "--limit", default="30", help="Exact GSM8K sample count or all (1319)"
         )
         sub.add_argument(
-            "--test", choices=("smoke", "gsm8k", "all", "perf"), default="all"
+            "--test", choices=("smoke", "gsm8k", "all", "perf"),
+            help="Defaults to perf for baseline, all for AFD",
         )
         sub.add_argument(
             "--perf-input-lens",
@@ -169,7 +173,7 @@ def parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--baseline",
             action="store_true",
-            help="Native V2-Lite baseline on 4 devices",
+            help="Native vLLM-Ascend performance baseline without AFD",
         )
         sub.add_argument(
             "--vllm-arg",

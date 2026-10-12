@@ -24,7 +24,7 @@ def test_busy_port_fails_before_loading_npu_environment():
         server.bind(("127.0.0.1", 0))
         server.listen()
         port = server.getsockname()[1]
-        args = SimpleNamespace(api_host="127.0.0.1", api_port=port, afd_port=port)
+        args = SimpleNamespace(api_host="127.0.0.1", api_port=port, afd_port=port, ports=None)
         with pytest.raises(OSError) as error:
             probe(args)
         assert error.value.errno == errno.EADDRINUSE
@@ -71,6 +71,7 @@ def test_missing_cam_ops_fail_preflight(monkeypatch, tmp_path, async_cam):
         api_host="127.0.0.1",
         api_port=12345,
         afd_port=6455,
+        ports=None,
         nic=None,
         repo=str(tmp_path),
         devices="0",

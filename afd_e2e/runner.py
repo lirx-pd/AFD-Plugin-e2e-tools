@@ -18,6 +18,7 @@ from . import __version__, coverage, evaluation
 from .config import TOOL_ROOT, Case
 from .planner import Service, build_services, environment, network, runtime_environment
 from .reporting import LOG_FAILURE, is_profiler_advisory, report_text
+from .routing import routes
 from .process_utils import (
     close_process_identities,
     find_processes_matching_environment,
@@ -136,9 +137,8 @@ class ManagedProcess:
 
 
 def wait_ready(case: Case, services: list[ManagedProcess], progress=None) -> None:
-    host = "127.0.0.1" if case.api_host == "0.0.0.0" else case.api_host
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    url = f"http://{host}:{case.api_port}/v1/models"
+    pending = {route["url"] + "/v1/models" for route in routes(case.to_dict())}
     deadline = time.monotonic() + case.startup_timeout
     last_error = None
     expected = "afd-e2e-baseline" if case.baseline else "afd-e2e-attention"
@@ -147,18 +147,21 @@ def wait_ready(case: Case, services: list[ManagedProcess], progress=None) -> Non
             progress()
         for service in services:
             service.ensure_alive()
-        try:
-            with opener.open(url, timeout=3) as response:
-                data = json.load(response)
-                if response.status == 200 and any(
-                    model["id"] == expected for model in data["data"]
-                ):
-                    print(f"API ready: {url}", flush=True)
-                    return
-        except (OSError, ValueError, KeyError, urllib.error.URLError) as exc:
-            last_error = exc
+        for url in sorted(pending):
+            try:
+                with opener.open(url, timeout=3) as response:
+                    data = json.load(response)
+                    if response.status == 200 and any(
+                        model["id"] == expected for model in data["data"]
+                    ):
+                        print(f"API ready: {url}", flush=True)
+                        pending.remove(url)
+            except (OSError, ValueError, KeyError, urllib.error.URLError) as exc:
+                last_error = exc
+        if not pending:
+            return
         time.sleep(0.5)
-    raise TimeoutError(f"API startup timed out at {url}; last error={last_error!r}")
+    raise TimeoutError(f"API startup timed out at {sorted(pending)}; last error={last_error!r}")
 
 
 def source_manifest(case: Case) -> dict:
@@ -193,7 +196,8 @@ def source_manifest(case: Case) -> dict:
         path = case.repo / name
         if path.is_file():
             source["afd-plugin/" + name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return {"harness_version": __version__, "source_sha256": source, "afd_plugin": git}
+    return {"harness_version": __version__, "source_sha256": source,
+            "afd_plugin": git if not case.baseline else None}
 
 
 def _preflight_command(case: Case, devices: tuple[str, ...]) -> tuple[str, ...]:
@@ -225,6 +229,11 @@ def _preflight_command(case: Case, devices: tuple[str, ...]) -> tuple[str, ...]:
         probe_cmd.append("--layered")
     if case.baseline:
         probe_cmd.append("--baseline")
+        instances = len(case.baseline_layouts)
+        probe_cmd.extend((
+            "--ports",
+            ",".join(str(case.api_port + i) for i in range(2 * instances)),
+        ))
     return tuple(probe_cmd)
 
 
@@ -272,7 +281,7 @@ def execute(case: Case) -> dict:
             "Specify --device/--devices or inherit ASCEND_RT_VISIBLE_DEVICES "
             "through npu run"
         )
-    if not (case.repo / "afd_plugin").is_dir():
+    if not case.baseline and not (case.repo / "afd_plugin").is_dir():
         raise ValueError(
             f"Sibling afd-plugin not found at {case.repo}; use --repo to override"
         )
@@ -396,6 +405,7 @@ def execute(case: Case) -> dict:
         write_json(run_dir / "manifest.json", manifest)
         specifications = build_services(case, case.devices, run_id)
         manifest["services"] = [service.to_dict() for service in specifications]
+        manifest["routes"] = routes(case.to_dict())
         write_json(run_dir / "manifest.json", manifest)
         probe_service = Service(
             "probe",

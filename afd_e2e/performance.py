@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .runner import write_json
+from .routing import routes
 
 SEED = 42
 METRICS = ("ttft_ms", "tpot_ms", "e2e_ms", "client_queue_ms", "scheduler_lag_ms")
@@ -127,13 +128,13 @@ async def events(response):
         yield "\n".join(data)
 
 
-async def stream_request(client, url: str, body: dict, record: dict) -> None:
+async def stream_request(client, url: str, body: dict, record: dict, headers: dict) -> None:
     first = last = None
     usage = None
     finished = None
     done = False
     chunks = 0
-    async with client.stream("POST", url, json=body) as response:
+    async with client.stream("POST", url, json=body, headers=headers) as response:
         response.raise_for_status()
         async for event in events(response):
             if done:
@@ -192,7 +193,7 @@ async def stream_request(client, url: str, body: dict, record: dict) -> None:
 
 
 async def batch(
-    client, url, model, vocabulary, point, count, phase, timeout, records, raw, state
+    client, endpoints, model, vocabulary, point, count, phase, timeout, records, raw, state
 ):
     import httpx
 
@@ -230,7 +231,10 @@ async def batch(
                 peak = max(peak, active)
                 try:
                     await asyncio.wait_for(
-                        stream_request(client, url, body, record), timeout
+                        stream_request(
+                            client, record["route"]["url"] + "/v1/completions",
+                            body, record, record["route"]["headers"],
+                        ), timeout
                     )
                 finally:
                     active -= 1
@@ -262,6 +266,7 @@ async def batch(
                 "point": point["id"],
                 "phase": phase,
                 "index": index,
+                "route": endpoints[index % len(endpoints)],
                 "input_target": rng.choices(
                     point["input_lens"], weights=point["weights"]
                 )[0],
@@ -289,13 +294,15 @@ async def evaluate(config: dict, run_dir: Path) -> dict:
     import httpx
 
     settings = config["performance"]
-    host = "127.0.0.1" if config["api_host"] == "0.0.0.0" else config["api_host"]
-    base = f"http://{host}:{config['api_port']}"
+    endpoints = routes(config)
+    warmup_count = max(settings["warmup"], len(endpoints)) if settings["warmup"] else 0
+    base = endpoints[0]["url"]
     url = base + "/v1/completions"
     model = "afd-e2e-baseline" if config["baseline"] else "afd-e2e-attention"
     result = {
         "status": "running",
         "endpoint": url,
+        "routes": endpoints,
         "input_mode": "token_ids",
         "seed": SEED,
         "configuration": settings,
@@ -341,6 +348,7 @@ async def evaluate(config: dict, run_dir: Path) -> dict:
                 for number, point in enumerate(planned, 1):
                     entry = {
                         **point,
+                        "warmup_requests": warmup_count,
                         "status": "running",
                         "started_at": datetime.now(timezone.utc).isoformat(),
                     }
@@ -351,11 +359,11 @@ async def evaluate(config: dict, run_dir: Path) -> dict:
                     try:
                         await batch(
                             client,
-                            url,
+                            endpoints,
                             model,
                             vocabulary,
                             {**point, "rps": None},
-                            settings["warmup"],
+                            warmup_count,
                             "warmup",
                             config["request_timeout"],
                             warmup,
@@ -371,7 +379,7 @@ async def evaluate(config: dict, run_dir: Path) -> dict:
                             )
                         await batch(
                             client,
-                            url,
+                            endpoints,
                             model,
                             vocabulary,
                             point,
