@@ -137,12 +137,19 @@ def test_accuracy_failure_still_cleans_up_children(
     assert all(code is not None for code in summary["process_exit_codes"].values())
 
 
-def test_native_multi_instance_performance_lifecycle(make_case, simulated_runtime, tmp_path):
+@pytest.mark.parametrize(
+    "phase,input_len,output_len",
+    [("end-to-end", 8, 4), ("prefill", 8, 1), ("decode", 1, 4)],
+)
+def test_native_multi_instance_performance_lifecycle(
+    make_case, simulated_runtime, tmp_path, phase, input_len, output_len
+):
     case = make_case(
         *simulated_runtime, "--baseline", "--topology", "dp1,dp2",
         "--repo", tmp_path / "missing-plugin", "--device", "0,1,2",
-        "--perf-mode", "matrix", "--perf-input-lens", "8",
-        "--perf-output-lens", "4", "--perf-concurrencies", "3",
+        "--perf-phase", phase,
+        "--perf-mode", "matrix", "--perf-input-lens", str(input_len),
+        "--perf-output-lens", str(output_len), "--perf-concurrencies", "3",
         "--perf-requests", "6", "--perf-warmup", "3",
     )
     summary = runner.execute(case)
@@ -158,6 +165,16 @@ def test_native_multi_instance_performance_lifecycle(make_case, simulated_runtim
     ).read_text().splitlines()]
     measured = [r for r in records if r["phase"] == "measured"]
     assert [r["route"]["domain"] for r in measured] == [0, 1, 2, 0, 1, 2]
+    assert {r["phase"] for r in records} == {"warmup", "measured"}
+    assert all(r["performance_phase"] == phase for r in records)
+    assert all(
+        (r["input_tokens"], r["output_tokens"]) == (input_len, output_len)
+        for r in records
+    )
+    point = summary["performance"]["points"][0]
+    assert point["phase"] == phase
+    assert point["metrics"]["tpot_ms"]["count"] == (0 if phase == "prefill" else 6)
+    assert f"point-000 {phase} matrix" in (case.run_dir / "report.txt").read_text()
 
 
 @pytest.mark.parametrize("comm", ["sync", "async"])

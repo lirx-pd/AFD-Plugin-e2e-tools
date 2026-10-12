@@ -37,6 +37,7 @@ def points(config: dict) -> list[dict]:
         {
             "id": f"point-{index:03d}",
             **workload,
+            "phase": config["phase"],
             "concurrency": concurrency,
             "rps": rate,
             "arrival": config["arrival"],
@@ -265,6 +266,7 @@ async def batch(
             record = {
                 "point": point["id"],
                 "phase": phase,
+                "performance_phase": point["phase"],
                 "index": index,
                 "route": endpoints[index % len(endpoints)],
                 "input_target": rng.choices(

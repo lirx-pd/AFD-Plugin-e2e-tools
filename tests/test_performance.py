@@ -42,12 +42,20 @@ def sse(values):
 def stream_values(input_tokens=8, output_tokens=4):
     return [
         {"choices": [{"text": "", "token_ids": [], "finish_reason": None}]},
-        {
-            "choices": [
-                {"text": "你\u2028好", "token_ids": [1, 2], "finish_reason": None}
-            ]
-        },
-        {"choices": [{"text": "end", "token_ids": [3, 4], "finish_reason": None}]},
+        *[
+            {
+                "choices": [
+                    {
+                        "text": "你\u2028好",
+                        "token_ids": list(
+                            range(index, min(index + 2, output_tokens + 1))
+                        ),
+                        "finish_reason": None,
+                    }
+                ]
+            }
+            for index in range(1, output_tokens + 1, 2)
+        ],
         {"choices": [{"text": "", "token_ids": [], "finish_reason": "length"}]},
         {
             "choices": [],
@@ -82,7 +90,92 @@ def test_plan_covers_lengths_concurrency_rates_and_mixed(make_case):
     assert sum(p["mode"] == "matrix" for p in pts) == 16
     assert all(p["weights"] == (8, 1) for p in pts if p["mode"] == "mixed")
     assert {p["rps"] for p in pts} == {2, None}
+    assert all(p["phase"] == "end-to-end" for p in pts)
     json.dumps(planned, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "flags,phase,input_lens,output_lens",
+    [
+        ([], "end-to-end", (128, 512, 2048), (128,)),
+        (["--perf-phase", "end-to-end"], "end-to-end", (128, 512, 2048), (128,)),
+        (["--perf-phase", "prefill"], "prefill", (128, 512, 2048), (1,)),
+        (["--perf-phase", "decode"], "decode", (1,), (128,)),
+    ],
+)
+def test_performance_phase_defaults(make_case, flags, phase, input_lens, output_lens):
+    config = make_case("--test", "perf", *flags).performance
+    assert config.phase == phase
+    assert config.input_lens == input_lens and config.output_lens == output_lens
+    assert config.weights == (1,) * len(input_lens)
+
+
+@pytest.mark.parametrize(
+    "phase,length_flags,input_lens,output_lens,weights",
+    [
+        (
+            "prefill", ["--perf-input-lens", "8,32", "--perf-weights", "8,1"],
+            (8, 32), (1,), (8, 1),
+        ),
+        (
+            "decode", ["--perf-output-lens", "4,16", "--perf-weights", "2"],
+            (1,), (4, 16), (2,),
+        ),
+    ],
+)
+def test_phase_plans_preserve_load_scans_and_weights(
+    make_case, phase, length_flags, input_lens, output_lens, weights
+):
+    case = make_case(
+        "--test", "perf", "--perf-phase", phase, *length_flags,
+        "--perf-concurrencies", "1,3", "--rps", "2,inf",
+        "--perf-requests", "7", "--perf-warmup", "2", "--perf-arrival", "poisson",
+    )
+    planned = describe(case)
+    pts = planned["performance_points"]
+    assert len(pts) == len({p["id"] for p in pts}) == 12
+    assert sum(p["mode"] == "matrix" for p in pts) == 8
+    assert {(p["concurrency"], p["rps"]) for p in pts} == {
+        (1, 2), (1, None), (3, 2), (3, None),
+    }
+    assert all(p["phase"] == phase and p["requests"] == 7 for p in pts)
+    assert all(p["arrival"] == "poisson" for p in pts)
+    assert case.performance.warmup == 2
+    for point in pts:
+        if point["mode"] == "mixed":
+            assert point["input_lens"] == input_lens
+            assert point["output_lens"] == output_lens and point["weights"] == weights
+        else:
+            assert point["input_lens"][0] in input_lens
+            assert point["output_lens"][0] in output_lens
+    json.dumps(planned, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "phase,boundary", [("end-to-end", 2176), ("prefill", 2049), ("decode", 129)]
+)
+def test_phase_model_length_uses_effective_defaults(make_case, phase, boundary):
+    flags = ("--test", "perf", "--perf-phase", phase, "--max-model-len")
+    assert make_case(*flags, boundary).max_model_len == boundary
+    with pytest.raises(ValueError, match="input \\+ output length"):
+        make_case(*flags, boundary - 1)
+
+
+@pytest.mark.parametrize(
+    "phase,flags",
+    [
+        ("prefill", ["--perf-output-lens", "2"]),
+        ("prefill", ["--perf-output-lens", "1,4"]),
+        ("decode", ["--perf-input-lens", "8"]),
+        ("decode", ["--perf-input-lens", "1,8"]),
+        ("decode", ["--perf-output-lens", "1"]),
+        ("decode", ["--perf-output-lens", "1,4"]),
+        ("decode", ["--perf-weights", "1,2"]),
+    ],
+)
+def test_conflicting_phase_settings_fail_before_allocation(make_case, phase, flags):
+    with pytest.raises(ValueError):
+        make_case("--test", "perf", "--perf-phase", phase, *flags)
 
 
 @pytest.mark.parametrize(
@@ -193,6 +286,63 @@ def test_one_special_token_has_ttft_but_no_tpot():
 
     record = asyncio.run(run())
     assert record["ttft_ms"] > 0 and record["tpot_ms"] is None
+
+
+@pytest.mark.parametrize(
+    "phase,input_tokens,output_tokens",
+    [("end-to-end", 8, 4), ("prefill", 8, 1), ("decode", 1, 4)],
+)
+def test_phase_requests_use_exact_tokens_and_keep_warmup_separate(
+    make_case, tmp_path, monkeypatch, phase, input_tokens, output_tokens
+):
+    config = make_case(
+        "--test", "perf", "--perf-phase", phase, "--perf-mode", "matrix",
+        "--perf-input-lens", input_tokens, "--perf-output-lens", output_tokens,
+        "--perf-concurrencies", "2", "--perf-requests", "3", "--perf-warmup", "2",
+    ).to_dict()
+    bodies = []
+
+    def handler(request):
+        if request.url.path == "/tokenize":
+            return httpx.Response(200, json={"tokens": [100, 101]})
+        body = json.loads(request.content)
+        assert len(body["prompt"]) == input_tokens
+        assert set(body["prompt"]) <= {100, 101}
+        assert body["max_tokens"] == output_tokens
+        assert body["ignore_eos"] is True and body["add_special_tokens"] is False
+        assert body["return_token_ids"] is True and body["stream"] is True
+        assert body["stream_options"] == {"include_usage": True}
+        bodies.append(body)
+        return httpx.Response(
+            200, stream=Chunks(sse(stream_values(input_tokens, output_tokens)), delay=0.001)
+        )
+
+    native_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: native_client(transport=httpx.MockTransport(handler), **kw),
+    )
+    result = asyncio.run(performance.evaluate(config, tmp_path))
+    assert result["status"] == "passed" and len(bodies) == 5
+    point = result["points"][0]
+    assert point["phase"] == phase
+    assert point["warmup"]["completed"] == 2 and point["completed"] == 3
+    assert point["metrics"]["ttft_ms"]["count"] == 3
+    assert point["metrics"]["tpot_ms"]["count"] == (3 if output_tokens > 1 else 0)
+    if output_tokens > 1:
+        assert point["metrics"]["tpot_ms"]["mean"] > 0
+    else:
+        assert point["metrics"]["tpot_ms"]["mean"] is None
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "performance" / "requests.jsonl").read_text().splitlines()
+    ]
+    assert sum(row["phase"] == "warmup" for row in rows) == 2
+    assert sum(row["phase"] == "measured" for row in rows) == 3
+    assert all(row["performance_phase"] == phase for row in rows)
+    assert all(row["input_tokens"] == input_tokens for row in rows)
+    assert all(row["output_tokens"] == output_tokens for row in rows)
 
 
 @pytest.mark.parametrize(

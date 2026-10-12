@@ -83,14 +83,19 @@ def parser() -> argparse.ArgumentParser:
             help="Defaults to perf for baseline, all for AFD",
         )
         sub.add_argument(
+            "--perf-phase",
+            choices=("end-to-end", "prefill", "decode"),
+            default="end-to-end",
+            help="prefill outputs one token; decode inputs one token and outputs multiple",
+        )
+        sub.add_argument(
             "--perf-input-lens",
-            default="128,512,2048",
-            help="Input token lengths, comma-separated",
+            help="Input token lengths, comma-separated; "
+            "default 1 for decode, else 128,512,2048",
         )
         sub.add_argument(
             "--perf-output-lens",
-            default="128",
-            help="Output token lengths, comma-separated",
+            help="Output token lengths, comma-separated; default 1 for prefill, else 128",
         )
         sub.add_argument(
             "--perf-concurrencies",

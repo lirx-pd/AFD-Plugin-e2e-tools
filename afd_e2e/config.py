@@ -64,18 +64,42 @@ class PerformanceConfig:
     warmup: int
     mode: str
     arrival: str
+    phase: str
 
 
 def performance_configuration(args) -> PerformanceConfig:
+    input_default = "1" if args.perf_phase == "decode" else "128,512,2048"
+    output_default = "1" if args.perf_phase == "prefill" else "128"
     lengths = {
-        name: tuple(int(value) for value in getattr(args, "perf_" + name).split(","))
-        for name in ("input_lens", "output_lens", "concurrencies")
+        name: tuple(int(value) for value in raw.split(","))
+        for name, raw in (
+            (
+                "input_lens",
+                args.perf_input_lens
+                if args.perf_input_lens is not None
+                else input_default,
+            ),
+            (
+                "output_lens",
+                args.perf_output_lens
+                if args.perf_output_lens is not None
+                else output_default,
+            ),
+            ("concurrencies", args.perf_concurrencies),
+        )
     }
     for name, values in lengths.items():
         if not values or min(values) <= 0 or len(set(values)) != len(values):
             raise ValueError(
                 f"perf-{name.replace('_', '-')} requires unique positive integers"
             )
+    if args.perf_phase == "prefill" and lengths["output_lens"] != (1,):
+        raise ValueError("--perf-phase prefill requires --perf-output-lens 1")
+    if args.perf_phase == "decode":
+        if lengths["input_lens"] != (1,):
+            raise ValueError("--perf-phase decode requires --perf-input-lens 1")
+        if min(lengths["output_lens"]) <= 1:
+            raise ValueError("--perf-phase decode requires output lengths greater than 1")
     rates = tuple(
         None if value.strip().lower() == "inf" else float(value)
         for value in args.perf_rps.split(",")
@@ -109,6 +133,7 @@ def performance_configuration(args) -> PerformanceConfig:
         warmup=args.perf_warmup,
         mode=args.perf_mode,
         arrival=args.perf_arrival,
+        phase=args.perf_phase,
     )
 
 

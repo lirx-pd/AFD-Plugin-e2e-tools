@@ -100,7 +100,8 @@ def report_text(summary: dict) -> str:
         for point in performance["points"]:
             metrics = point.get("metrics", {})
             lines.append(
-                f"{point['id']} {point['mode']} input={point['input_lens']} output={point['output_lens']} "
+                f"{point['id']} {point.get('phase', 'end-to-end')} {point['mode']} "
+                f"input={point['input_lens']} output={point['output_lens']} "
                 f"C={point['concurrency']} RPS={point['rps'] if point['rps'] is not None else 'inf'} "
                 f"passed={point.get('completed', 0)}/{point['requests']}"
             )

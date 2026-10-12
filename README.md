@@ -243,6 +243,24 @@ npu run --gpus 4 --nonblock -- python run.py run \
 默认依次测试各输入长度，再测试短 / 长请求混合；每种负载扫描并发上限和 RPS。
 `plan` 输出完整的 `performance_points`，可以先核对测试点数量。
 
+通过 `--perf-phase` 分别测试 prefill 和 decode，默认 `end-to-end` 保持原有输入 / 输出负载。
+prefill 每个请求固定输出 1 token，可扫描输入长度；decode 每个请求固定输入 1 token，
+可扫描大于 1 的输出长度。两者均可调整并发、RPS、到达方式、请求数、预热数及原有服务参数。
+
+```bash
+# Prefill: vary input length; each request generates exactly one token.
+python run.py plan --test perf --perf-phase prefill --perf-mode matrix \
+  --perf-input-lens 128,512,2048 --perf-concurrencies 1,8,32 --rps 2,8,inf
+
+# Decode: each request inputs exactly one token and generates multiple tokens.
+python run.py plan --test perf --perf-phase decode --perf-mode matrix \
+  --perf-output-lens 128,512 --perf-concurrencies 1,8,32 --rps 2,8,inf
+```
+
+核对计划后，将 `plan` 改成 `run`，按前述 `npu run` 用法运行完整测试。
+显式指定与阶段冲突的长度会在设备分配前报错：prefill 仅接受 `--perf-output-lens 1`，
+decode 仅接受 `--perf-input-lens 1`，且每个输出长度必须大于 1。
+
 ```bash
 # Fixed-length matrix: input x output x concurrency x RPS.
 npu run --gpus 4 --nonblock -- python run.py run \
@@ -265,8 +283,9 @@ npu run --gpus 16 --nonblock -- python run.py run \
 
 | 参数 | 选择 / 默认 |
 | --- | --- |
-| `--perf-input-lens` | 输入 token 数，逗号分隔；默认 `128,512,2048` |
-| `--perf-output-lens` | 输出 token 数，逗号分隔；默认 `128` |
+| `--perf-phase` | `end-to-end` / `prefill` / `decode`，默认 end-to-end |
+| `--perf-input-lens` | 输入 token 数，逗号分隔；decode 默认且固定 `1`，其他阶段默认 `128,512,2048` |
+| `--perf-output-lens` | 输出 token 数，逗号分隔；prefill 默认且固定 `1`，其他阶段默认 `128` |
 | `--perf-concurrencies` | 客户端同时在途请求上限，逗号分隔；默认 `1,8,32` |
 | `--rps` / `--perf-rps` | 到达速率，支持逗号分隔扫描；默认 `inf`，持续填满并发上限 |
 | `--perf-mode` | `matrix` 固定长度矩阵 / `mixed` 混合 / `both` 两者，默认 both |
@@ -305,9 +324,16 @@ TPOT 为 `(E2E - TTFT) / (实际输出 token 数 - 1)`，再对各请求统计�
 流式分块可能包含多个 token，不能把分块数当成 token 数。仅输出一个 token 时 TPOT
 为 null，不纳入 TPOT 的样本数；失败请求不纳入生成延迟统计，仍保留错误及排队信息。
 
+prefill 主要查看 TTFT、成功请求速率和 `input_tokens_per_second`；decode 主要查看
+TPOT 和 `output_tokens_per_second`。decode 请求仍包含单 token 输入的 prefill 和首 token
+生成时间；TPOT 排除首 token 等待，吞吐仍按完整正式阶段耗时计算。
+
 逐请求原始数据在 `performance/requests.jsonl`，包含预热 / 正式标记、长度、随机种子、
-到达和发送时间、延迟、usage、分块数及失败原因。取消或超时也保留已产生的数据，
-并沿用原有进程清理、设备释放流程。`report.txt` 提供简短指标，`pack` 会收录这些结果。
+到达和发送时间、延迟、usage、分块数及失败原因。
+配置及每个测试点的 `phase` 记录性能阶段；逐请求 `performance_phase` 记录相同阶段，
+原有 `phase` 继续区分 `warmup` 和 `measured`。
+取消或超时也保留已产生的数据，并沿用原有进程清理、设备释放流程。
+`report.txt` 提供简短指标，`pack` 会收录这些结果。
 这是合成 token 负载的客户端性能测量，包含 HTTP 和流式缓冲的影响；精度仍用 GSM8K 测试。
 逐请求数据和精确分位数在内存中保存，超大请求数应分批运行。
 
