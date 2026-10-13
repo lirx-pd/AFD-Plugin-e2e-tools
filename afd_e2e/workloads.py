@@ -1,4 +1,4 @@
-"""Cancellable concurrent smoke and DBO coverage requests, in a child process."""
+"""Cancellable concurrent HTTP smoke requests, in a child process."""
 
 from __future__ import annotations
 
@@ -15,11 +15,10 @@ from .routing import routes
 def evaluate(config: dict, kind: str, output: Path) -> None:
     import httpx
 
-    smoke = kind == "smoke"
-    concurrency = min(10, config["concurrency"]) if smoke else config["concurrency"]
-    count = concurrency if smoke else 2 * concurrency
+    concurrency = min(10, config["concurrency"])
+    count = concurrency
     v4 = config["model"] == "v4-flash"
-    max_tokens = 32 if smoke else 128
+    max_tokens = 32
     if v4:
         max_tokens = 256
     role = "baseline" if config["baseline"] else "attention"
@@ -27,7 +26,7 @@ def evaluate(config: dict, kind: str, output: Path) -> None:
     path = "/v1/" + (
         "chat/completions" if v4 else "completions"
     )
-    check_answer = smoke and v4
+    check_answer = v4
     results = [
         {"index": index, "error": "Request not completed"} for index in range(count)
     ]
@@ -44,10 +43,6 @@ def evaluate(config: dict, kind: str, output: Path) -> None:
                     route = endpoints[index % len(endpoints)]
                     item["route"] = route
                     prompt = f"Compute {12 + index} + 7. Reply with just the number."
-                    if not smoke:
-                        prompt = (
-                            "Solve carefully and show the arithmetic steps. " + prompt
-                        )
                     item["prompt"] = prompt
                     item["started_at"] = time.monotonic()
                     body = {
@@ -132,8 +127,7 @@ def evaluate(config: dict, kind: str, output: Path) -> None:
     if errors:
         raise RuntimeError("; ".join(errors))
     if (
-        smoke
-        and concurrency > 1
+        concurrency > 1
         and max(item["started_at"] for item in results)
         >= min(item["finished_at"] for item in results)
     ):
@@ -147,7 +141,7 @@ def evaluate(config: dict, kind: str, output: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--kind", choices=("smoke", "coverage"), required=True)
+    parser.add_argument("--kind", choices=("smoke",), required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 

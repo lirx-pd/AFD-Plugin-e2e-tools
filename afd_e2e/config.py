@@ -182,6 +182,8 @@ class Case:
     common_args: tuple[str, ...]
     attention_args: tuple[str, ...]
     ffn_args: tuple[str, ...]
+    omit_args: tuple[str, ...]
+    serve_env: tuple[str, ...]
 
     @property
     def attention_ranks(self) -> int:
@@ -334,6 +336,8 @@ def from_args(args) -> Case:
         common_args=tuple(args.vllm_arg),
         attention_args=tuple(args.attention_arg),
         ffn_args=tuple(args.ffn_arg),
+        omit_args=tuple(args.omit_vllm_arg),
+        serve_env=tuple(args.serve_env),
     )
     validate(case)
     return case
@@ -352,7 +356,6 @@ def validate(case: Case) -> None:
         raise ValueError("v4-flash requires Attention DP2/TP4 + FFN DP8/TP1/EP8")
     if case.baseline and (
         case.comm != "sync"
-        or case.dbo
         or case.layered_gmm
         or case.moe_ubatching
     ):
@@ -362,23 +365,8 @@ def validate(case: Case) -> None:
     if case.baseline:
         if case.test not in {"perf", "smoke"}:
             raise ValueError("Baseline supports perf and smoke; GSM8K routing is not enabled")
-    if case.comm == "async" and case.execution != "eager":
-        raise ValueError("Async CAM requires eager execution")
     if case.comm == "sync" and case.moe_ubatching:
-        raise ValueError("--moe-ubatching requires --comm async")
-    if case.dbo and case.ffn_mrv == "mrv2":
-        raise ValueError("Native NPU DBO requires FFN MRV1")
-    if case.dbo and case.mrv == "mrv2" and case.execution != "eager":
-        raise ValueError("Native NPU MRV2 DBO requires eager execution")
-    if case.layered_gmm and (
-        case.model != "v4-flash"
-        or case.comm != "async"
-        or case.execution != "eager"
-        or case.dynamic_quant != 1
-    ):
-        raise ValueError(
-            "Current Layered GMM requires V4, async, eager and dynamicQuant=1"
-        )
+        raise ValueError("--moe-ubatching configures the async deployment template")
     if case.devices is not None and len(case.devices) < case.required_devices:
         raise ValueError(
             f"Topology needs {case.required_devices} devices; "
@@ -414,10 +402,6 @@ def validate(case: Case) -> None:
         raise ValueError("memory-utilization must be in (0, 1)")
     if not case.capture_sizes or any(size <= 0 for size in case.capture_sizes):
         raise ValueError("capture-sizes must contain positive integers")
-    if case.execution == "graph" and max(case.capture_sizes) < case.max_seqs:
-        raise ValueError("Largest graph capture size must cover max-seqs")
-    if case.comm == "async" and case.max_batched_tokens % case.attention_tp:
-        raise ValueError("Async max-batched-tokens must be divisible by Attention TP")
     port_count = 2 * len(case.baseline_layouts) if case.baseline else 2
     if not 1 <= case.api_port <= 65536 - port_count or (not case.baseline and (
         not 1 <= case.afd_port <= 65535
@@ -428,33 +412,27 @@ def validate(case: Case) -> None:
         "--host",
         "--port",
         "--served-model-name",
-        "--additional-config",
         "--data-parallel-size",
         "--data-parallel-rpc-port",
         "--tensor-parallel-size",
-        "--enable-expert-parallel",
-        "--no-enable-expert-parallel",
-        "--enforce-eager",
-        "--no-enforce-eager",
-        "--compilation-config",
-        "--enable-dbo",
-        "--no-enable-dbo",
-        "--dbo-decode-token-threshold",
-        "--dbo-prefill-token-threshold",
-        "--worker-extension-cls",
         "--max-model-len",
         "--max-num-batched-tokens",
         "--max-num-seqs",
         "--gpu-memory-utilization",
-        "--shutdown-timeout",
-        "--seed",
-        "--async-scheduling",
-        "--no-async-scheduling",
-        "--enable-prefix-caching",
-        "--no-enable-prefix-caching",
     }
     for token in (*case.common_args, *case.attention_args, *case.ffn_args):
         if token.split("=", 1)[0] in reserved:
             raise ValueError(
                 f"{token} is owned by the harness; use its dedicated option"
             )
+    for option in case.omit_args:
+        if not option.startswith("--") or "=" in option or option in reserved:
+            raise ValueError(f"Cannot omit harness-owned or invalid option: {option}")
+    for assignment in case.serve_env:
+        name, separator, _ = assignment.partition("=")
+        if (
+            not separator or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
+            or name in {"ASCEND_RT_VISIBLE_DEVICES", "AFD_E2E_RUN_ID",
+                        "AFD_E2E_PROCESS_ROLE", "PYTHONPATH"}
+        ):
+            raise ValueError(f"Invalid or harness-owned serve environment: {assignment}")

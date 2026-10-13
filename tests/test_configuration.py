@@ -74,31 +74,17 @@ def test_v4_layered_layout_and_flags(make_case, ffn_mrv):
 @pytest.mark.parametrize(
     "arguments",
     [
-        ["--comm", "async", "--execution", "graph"],
-        ["--mrv", "mrv2", "--dbo", "on"],
-        ["--mrv", "mrv2", "--ffn-mrv", "mrv1", "--dbo", "on", "--execution", "graph"],
         ["--model", "v4-flash"],
-        [
-            "--model",
-            "v4-flash",
-            "--model-path",
-            "/w",
-            "--comm",
-            "async",
-            "--dynamic-quant",
-            "0",
-            "--layered-gmm",
-            "on",
-        ],
         ["--moe-ubatching", "on"],
+        ["--vllm-arg=--port=10000"],
+        ["--omit-vllm-arg=--data-parallel-size"],
+        ["--omit-vllm-arg=shutdown-timeout"],
         ["--limit", "0"],
         ["--limit", "1320"],
         ["--threshold", "nan"],
         ["--max-model-len", "0"],
         ["--eval-timeout", "inf"],
         ["--devices", "0,1,1,2"],
-        ["--execution", "graph", "--max-seqs", "32"],
-        ["--vllm-arg=--enable-dbo"],
     ],
 )
 def test_rejects_invalid_configuration(make_case, arguments):
@@ -147,7 +133,7 @@ def test_inherited_environment_preserved(make_case, monkeypatch):
         make_case("--device", "0,1,2,3")
 
 
-def test_service_registers_custom_opp_before_can_initialization(
+def test_service_inherits_custom_opp_without_guessing_plugin_paths(
     make_case, monkeypatch, tmp_path
 ):
     vendor = tmp_path / "afd_plugin/_cann_ops_custom/vendors/afd-plugin"
@@ -156,10 +142,7 @@ def test_service_registers_custom_opp_before_can_initialization(
     case = make_case("--repo", str(tmp_path))
     services = build_services(case, ("0", "1", "2", "3"), "test")
     for service in services:
-        assert runtime_environment(service)["ASCEND_CUSTOM_OPP_PATH"].split(":") == [
-            str(vendor),
-            "/other/vendor",
-        ]
+        assert runtime_environment(service)["ASCEND_CUSTOM_OPP_PATH"] == "/other/vendor"
 
 
 def test_plan_without_devices_keeps_assignment_pending(monkeypatch, capsys):
@@ -243,3 +226,115 @@ def test_async_dbo_is_enabled_only_on_attention(make_case):
     attention, ffn = build_services(case, tuple(map(str, range(16))), "test")
     assert "--enable-dbo" in attention.command
     assert "--enable-dbo" not in ffn.command
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--comm", "async", "--execution", "graph"],
+        ["--mrv", "mrv2", "--dbo", "on", "--execution", "graph"],
+        ["--model", "v4-flash", "--model-path", "/w", "--layered-gmm", "on"],
+        ["--execution", "graph", "--max-seqs", "32"],
+        ["--comm", "async", "--max-batched-tokens", "17"],
+    ],
+)
+def test_runtime_decides_feature_support(make_case, flags):
+    case = make_case(*flags)
+    services = build_services(case, tuple(map(str, range(case.required_devices))), "test")
+    assert services
+    assert all("--worker-extension-cls" not in service.command for service in services)
+
+
+def test_serve_arguments_override_presets_and_common_arguments(make_case):
+    case = make_case(
+        "--execution", "graph", "--dbo", "on",
+        "--vllm-arg=--compilation-config", '--vllm-arg={"mode":0}',
+        "--vllm-arg=--no-enable-dbo", "--vllm-arg=--enable-prefix-caching",
+        '--vllm-arg=--additional-config={"common":true}',
+        "--attention-arg=--additional-config", '--attention-arg={"new_afd":true}',
+        "--vllm-arg=--lora-modules", "--vllm-arg=a=/a", "--vllm-arg=b=/b",
+        "--attention-arg=--lora-modules=c=/c",
+    )
+    services = {s.role: s for s in build_services(case, ("0", "1", "2", "3"), "test")}
+    attention, ffn = services["attention"].command, services["ffn"].command
+    for command in (attention, ffn):
+        assert command.count("--compilation-config") == 1
+        assert command[command.index("--compilation-config") + 1] == '{"mode":0}'
+        assert "--enable-dbo" not in command
+        assert "--no-enable-dbo" in command
+        assert "--no-enable-prefix-caching" not in command
+        assert "--enable-prefix-caching" in command
+    assert attention[attention.index("--additional-config") + 1] == '{"new_afd":true}'
+    assert '--additional-config={"common":true}' in ffn
+    assert "a=/a" not in attention and "b=/b" not in attention
+    assert "--lora-modules=c=/c" in attention
+    assert "a=/a" in ffn and "b=/b" in ffn
+
+
+def test_omit_version_specific_serve_options(make_case):
+    case = make_case(
+        "--execution", "graph",
+        "--omit-vllm-arg=--shutdown-timeout",
+        "--omit-vllm-arg=--compilation-config",
+        "--omit-vllm-arg=--enable-chunked-prefill",
+        "--vllm-arg=--enforce-eager",
+    )
+    for service in build_services(case, ("0", "1", "2", "3"), "test"):
+        command = service.command
+        assert "--shutdown-timeout" not in command and "10" not in command
+        assert "--compilation-config" not in command
+        assert not any("cudagraph_mode" in token for token in command)
+        assert "--enable-chunked-prefill" not in command
+        assert "--enforce-eager" in command
+        assert command[:2] == ("vllm", "serve")
+        assert "--data-parallel-size" in command
+
+
+def test_source_manifest_records_git_without_internal_source_hashes(make_case, tmp_path):
+    internal = tmp_path / "afd_plugin/v1/worker/npu/ffn_model_runner.py"
+    internal.parent.mkdir(parents=True)
+    internal.write_text("not imported")
+    manifest = runner.source_manifest(make_case("--repo", tmp_path))
+    assert not any(path.startswith("afd-plugin/") for path in manifest["source_sha256"])
+    assert manifest["afd_plugin"] is None
+
+
+def test_metadata_does_not_inherit_a_parent_git_repository(make_case, monkeypatch):
+    monkeypatch.setattr(
+        runner.subprocess, "run", lambda *_a, **_k: pytest.fail("looked up parent Git")
+    )
+    manifest = runner.source_manifest(make_case("--repo", config.TOOL_ROOT / "tests"))
+    assert manifest["afd_plugin"] is None
+
+
+def test_native_baseline_can_configure_standard_dbo(make_case):
+    case = make_case("--baseline", "--dbo", "on", "--mrv", "mrv2")
+    services = build_services(case, ("0", "1", "2", "3"), "test")
+    assert len(services) == 1
+    assert "--enable-dbo" in services[0].command
+    assert "--worker-extension-cls" not in services[0].command
+
+
+def test_deployment_environment_can_override_version_presets(make_case, monkeypatch):
+    monkeypatch.setenv("AFD_PLUGIN_EARLY_ENGINE_PATCH", "1")
+    case = make_case(
+        "--serve-env", "VLLM_PLUGINS=ascend,new_afd_entrypoint",
+        "--serve-env", "AFD_NEW_OPTION=value=with=equals",
+        "--serve-env", "VLLM_USE_V2_MODEL_RUNNER=1",
+    )
+    for service in build_services(case, ("0", "1", "2", "3"), "test"):
+        env = runtime_environment(service)
+        assert env["VLLM_PLUGINS"] == "ascend,new_afd_entrypoint"
+        assert env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+        assert env["AFD_NEW_OPTION"] == "value=with=equals"
+        assert env["AFD_PLUGIN_EARLY_ENGINE_PATCH"] == "1"
+        assert env["ASCEND_RT_VISIBLE_DEVICES"] == ",".join(service.devices)
+
+
+@pytest.mark.parametrize("value", [
+    "MISSING_VALUE", "0INVALID=yes", "ASCEND_RT_VISIBLE_DEVICES=8",
+    "AFD_E2E_RUN_ID=other", "AFD_E2E_PROCESS_ROLE=other", "PYTHONPATH=/other",
+])
+def test_serve_environment_preserves_device_and_process_ownership(make_case, value):
+    with pytest.raises(ValueError, match="serve environment"):
+        make_case("--serve-env", value)

@@ -69,6 +69,28 @@ def test_pack_keeps_evidence_and_inventories_excluded_dumps(finished_run, tmp_pa
     assert dump.exists() and external.read_text() == "private external file"
 
 
+def test_compact_pack_keeps_metrics_and_native_instance_log_evidence(finished_run):
+    metrics = finished_run / "metrics"
+    metrics.mkdir()
+    raw = b'# TYPE server_requests_total counter\nserver_requests_total 7\n'
+    (metrics / "before-0.prom").write_bytes(raw)
+    (finished_run / "baseline-0.log").write_text("startup\nERROR native worker failed\n")
+    summary = json.loads((finished_run / "summary.json").read_text())
+    summary["log_diagnostics"] = {
+        "baseline-0": {"inference": [
+            {"log": "baseline-0.log", "line": 2, "message": "ERROR native worker failed"}
+        ], "shutdown": []}
+    }
+    (finished_run / "summary.json").write_text(json.dumps(summary))
+    packed = pack(finished_run, compact=True)
+    with tarfile.open(packed["archive"]) as archive:
+        assert "baseline-0.log" not in archive.getnames()
+        assert archive.extractfile("metrics/before-0.prom").read() == raw
+        evidence = json.load(archive.extractfile("log-evidence.json"))
+        assert evidence["logs"]["baseline-0"]["lines"] == 2
+        assert evidence["excerpts"]["baseline-0"][1]["text"] == "ERROR native worker failed"
+
+
 def test_pack_rejects_a_run_still_in_cleanup(finished_run):
     (finished_run / "summary.json").write_text(
         '{"status": "passed", "stage": "cleanup"}'

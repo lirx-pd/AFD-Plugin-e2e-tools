@@ -19,12 +19,23 @@ from afd_e2e.process_utils import (
 
 
 @pytest.fixture
+def local_v4_weights(tmp_path):
+    model = tmp_path / "weights"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"model_type":"deepseek_v4","num_hidden_layers":2}'
+    )
+    (model / "model.safetensors").write_bytes(b"simulated checkpoint")
+    return str(model)
+
+
+@pytest.fixture
 def simulated_runtime(monkeypatch, tmp_path):
     fixture = Path(__file__).with_name("fake_runtime.py")
     native_process = runner.ManagedProcess
 
     def process(name, command, env, run_dir):
-        if name in {"preflight", "evaluation"}:
+        if name == "evaluation":
             command = (sys.executable, str(fixture), name, *command)
         return native_process(name, command, env, run_dir)
 
@@ -48,7 +59,6 @@ def simulated_runtime(monkeypatch, tmp_path):
             except OSError:
                 pass
     repo = tmp_path / "afd-plugin"
-    (repo / "afd_plugin").mkdir(parents=True)
     return [
         "--repo",
         str(repo),
@@ -74,12 +84,10 @@ def simulated_runtime(monkeypatch, tmp_path):
     [
         ["--dbo", "on", "--execution", "graph"],
         ["--comm", "async", "--mrv", "mrv2"],
-        ["--model", "v4-flash", "--model-path", "/weights", "--mrv", "mrv2"],
+        ["--model", "v4-flash", "--mrv", "mrv2"],
         [
             "--model",
             "v4-flash",
-            "--model-path",
-            "/weights",
             "--comm",
             "async",
             "--mrv",
@@ -90,10 +98,11 @@ def simulated_runtime(monkeypatch, tmp_path):
     ],
 )
 def test_run_lifecycle_with_real_http_and_children(
-    make_case, simulated_runtime, flags
+    make_case, simulated_runtime, local_v4_weights, flags
 ):
     devices = ",".join(map(str, range(16 if "v4-flash" in flags else 4)))
-    case = make_case(*simulated_runtime, "--device", devices, *flags)
+    model = ["--model-path", local_v4_weights] if "v4-flash" in flags else []
+    case = make_case(*simulated_runtime, "--device", devices, *flags, *model)
     summary = runner.execute(case)
     assert summary["status"] == "passed", summary["errors"]
     assert (
@@ -109,17 +118,83 @@ def test_run_lifecycle_with_real_http_and_children(
     assert summary["gsm8k"]["samples"] == 7
     assert all(code is not None for code in summary["process_exit_codes"].values())
     manifest = json.loads((case.run_dir / "manifest.json").read_text())
-    assert manifest["readiness"]["simulated"]
+    assert "simulated" not in manifest["readiness"]
     assert manifest["devices"] == list(case.devices)
     assert manifest["unused_devices"] == []
     assert (case.run_dir / "exit-code.txt").read_text() == "0\n"
-    if case.dbo:
-        assert (
-            len(
-                json.loads((case.run_dir / "dbo-workload.json").read_text())["requests"]
-            )
-            == 24
-        )
+    assert "coverage" not in summary
+    assert not (case.run_dir / "coverage.json").exists()
+    assert not (case.run_dir / "dbo-workload.json").exists()
+
+
+@pytest.mark.parametrize("test", ["smoke", "perf", "gsm8k", "all"])
+def test_all_test_modes_use_standard_serve_without_plugin_source(
+    make_case, simulated_runtime, tmp_path, test
+):
+    case = make_case(
+        *simulated_runtime,
+        "--repo", str(tmp_path / "uninstalled-plugin"),
+        "--device", "0,1,2,3",
+        "--test", test,
+        "--dbo", "on",
+        "--perf-mode", "matrix",
+        "--perf-input-lens", "8",
+        "--perf-output-lens", "4",
+        "--perf-concurrencies", "2",
+        "--perf-requests", "2",
+        "--perf-warmup", "0",
+    )
+    assert not case.repo.exists()
+    summary = runner.execute(case)
+    assert summary["status"] == "passed", summary["errors"]
+    assert summary["cleanup_status"] == "passed"
+    assert "coverage" not in summary
+    assert "coverage" not in summary["stage_durations"]
+    assert "dbo_workload" not in summary["stage_durations"]
+    assert not (case.run_dir / "coverage.json").exists()
+    assert not (case.run_dir / "dbo-workload.json").exists()
+    commands = json.loads((case.run_dir / "commands.json").read_text())
+    for entry in commands:
+        command = entry["command"]
+        assert "--worker-extension-cls" not in command
+        if "role" in entry:
+            assert command[command.index("serve") - 1] == case.vllm_bin
+            assert "AFD_E2E_EVENT" not in (
+                case.run_dir / f"{entry['role']}.log"
+            ).read_text()
+    assert (case.run_dir / "smoke.json").exists() == (test in {"smoke", "all"})
+    assert ("gsm8k" in summary) == (test in {"gsm8k", "all"})
+    assert ("performance" in summary) == (test == "perf")
+    if test == "perf":
+        assert summary["performance"]["points"][0]["completed"] == 2
+    if "gsm8k" in summary:
+        assert summary["gsm8k"]["samples"] == 7
+    for phase in ("before", "after"):
+        captured = summary["metrics"][phase]
+        assert captured
+        for result in captured.values():
+            assert result["status"] == "captured"
+            raw = (case.run_dir / result["path"]).read_text()
+            assert "# TYPE vllm:num_requests_running gauge\n" in raw
+            assert 'vllm:num_requests_running{model_name="afd-e2e-attention"} 0\n' in raw
+
+
+def test_metrics_unavailable_does_not_fail_smoke(
+    make_case, simulated_runtime, monkeypatch
+):
+    monkeypatch.setenv("AFD_E2E_FAKE_NO_METRICS", "1")
+    case = make_case(
+        *simulated_runtime, "--device", "0,1,2,3", "--test", "smoke"
+    )
+    summary = runner.execute(case)
+    assert summary["status"] == "passed", summary["errors"]
+    assert summary["inference_status"] == summary["cleanup_status"] == "passed"
+    assert (case.run_dir / "smoke.json").is_file()
+    for phase in ("before", "after"):
+        captured = summary["metrics"][phase]
+        assert captured
+        assert all(result["status"] == "unavailable" for result in captured.values())
+        assert all("404" in result["error"] for result in captured.values())
 
 
 def test_accuracy_failure_still_cleans_up_children(
@@ -155,7 +230,7 @@ def test_native_multi_instance_performance_lifecycle(
     summary = runner.execute(case)
     assert summary["status"] == "passed", summary["errors"]
     assert summary["cleanup_status"] == "passed"
-    assert summary["coverage"]["status"] == "not_applicable"
+    assert "coverage" not in summary
     assert "gsm8k" not in summary
     assert {"baseline-0", "baseline-1"} <= summary["process_exit_codes"].keys()
     manifest = json.loads((case.run_dir / "manifest.json").read_text())
@@ -164,7 +239,8 @@ def test_native_multi_instance_performance_lifecycle(
         case.run_dir / "performance/requests.jsonl"
     ).read_text().splitlines()]
     measured = [r for r in records if r["phase"] == "measured"]
-    assert [r["route"]["domain"] for r in measured] == [0, 1, 2, 0, 1, 2]
+    assert sorted(r["index"] for r in measured) == list(range(6))
+    assert all(r["route"]["domain"] == r["index"] % 3 for r in measured)
     assert {r["phase"] for r in records} == {"warmup", "measured"}
     assert all(r["performance_phase"] == phase for r in records)
     assert all(
@@ -179,7 +255,7 @@ def test_native_multi_instance_performance_lifecycle(
 
 @pytest.mark.parametrize("comm", ["sync", "async"])
 def test_v4_performance_lifecycle_reuses_devices_and_keeps_warmup_separate(
-    make_case, simulated_runtime, comm
+    make_case, simulated_runtime, local_v4_weights, comm
 ):
     case = make_case(
         *simulated_runtime,
@@ -188,7 +264,7 @@ def test_v4_performance_lifecycle_reuses_devices_and_keeps_warmup_separate(
         "--model",
         "v4-flash",
         "--model-path",
-        "/weights",
+        local_v4_weights,
         "--comm",
         comm,
         "--test",
@@ -267,7 +343,7 @@ def test_performance_failure_keeps_metrics_and_cleans_up_children(
 
 
 def test_async_dbo_profiling_advisory_keeps_performance_running(
-    make_case, simulated_runtime, monkeypatch
+    make_case, simulated_runtime, local_v4_weights, monkeypatch
 ):
     message = (
         "(Worker_DP0_EP0 pid=378826) [ERROR] [378826] profiler.py: "
@@ -281,7 +357,7 @@ def test_async_dbo_profiling_advisory_keeps_performance_running(
         "--model",
         "v4-flash",
         "--model-path",
-        "/weights",
+        local_v4_weights,
         "--comm",
         "async",
         "--mrv",
@@ -309,7 +385,7 @@ def test_async_dbo_profiling_advisory_keeps_performance_running(
     )
     summary = runner.execute(case)
     assert summary["status"] == "passed", summary["errors"]
-    assert summary["performance"]["status"] == summary["coverage"]["status"] == "passed"
+    assert summary["performance"]["status"] == "passed"
     assert summary["log_diagnostics"]["ffn"]["inference"] == []
     assert (
         summary["log_advisories"]["ffn"]
@@ -423,7 +499,7 @@ def test_inference_log_fault_aborts_and_cleans_up_children(
 
 @pytest.mark.parametrize("comm", ["sync", "async"])
 def test_v4_smoke_checks_answers_in_both_modes(
-    make_case, simulated_runtime, monkeypatch, comm
+    make_case, simulated_runtime, local_v4_weights, monkeypatch, comm
 ):
     monkeypatch.setenv("AFD_E2E_FAKE_WRONG_ANSWER", "1")
     case = make_case(
@@ -433,7 +509,7 @@ def test_v4_smoke_checks_answers_in_both_modes(
         "--model",
         "v4-flash",
         "--model-path",
-        "/weights",
+        local_v4_weights,
         "--comm",
         comm,
     )
@@ -607,6 +683,26 @@ def test_forced_termination_is_failure():
             process.kill()
         process.wait(timeout=2)
         process.stdout.close()
+
+
+def test_metrics_failure_does_not_skip_service_cleanup(
+    make_case, simulated_runtime, monkeypatch
+):
+    capture = runner.capture_metrics
+
+    def fail_after(config, output, phase):
+        if phase == "after":
+            raise RuntimeError("simulated metrics collector failure")
+        return capture(config, output, phase)
+
+    monkeypatch.setattr(runner, "capture_metrics", fail_after)
+    case = make_case(*simulated_runtime, "--device", "0,1,2,3", "--test", "smoke")
+    summary = runner.execute(case)
+    assert summary["status"] == "failed"
+    assert summary["failed_stage"] == "reporting"
+    assert summary["shutdown_status"] == summary["cleanup_status"] == "passed"
+    assert all(value is not None for value in summary["process_exit_codes"].values())
+    assert any("metrics collector failure" in error for error in summary["errors"])
 
 
 def test_workload_timeout_cleans_up_child(tmp_path):

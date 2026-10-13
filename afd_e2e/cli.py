@@ -8,18 +8,18 @@ import sys
 from pathlib import Path
 
 from .config import from_args
-from .planner import describe
-from .runner import execute, exit_code, write_json
-from .reporting import pack, read_status, status_text
+from .reporting import pack, read_status, status_text, write_json
 
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
-        description="Portable AFD NPU E2E tests; afd-plugin is a sibling directory"
+        description="Portable AFD NPU E2E tests; afd-plugin is a sibling directory",
+        epilog="help, plan, status and pack need no inference runtime. "
+        "run starts standard vllm serve commands and tests them through HTTP.",
     )
     subparsers = root.add_subparsers(dest="command", required=True)
     archive = subparsers.add_parser(
-        "pack", help="Pack finished run logs without NPU dumps"
+        "pack", help="Offline: pack finished run logs without loading the inference runtime"
     )
     archive.add_argument("run_dir", type=Path)
     archive.add_argument("--output", type=Path, help="New archive path")
@@ -29,7 +29,7 @@ def parser() -> argparse.ArgumentParser:
         help="Keep reports and error context; omit full service logs",
     )
     status = subparsers.add_parser(
-        "status", help="Read one run or compare a directory of runs; no NPU needed"
+        "status", help="Offline: read saved run results without loading the inference runtime"
     )
     status.add_argument(
         "paths", type=Path, nargs="+", help="Run directories or their parent directory"
@@ -38,7 +38,13 @@ def parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Output complete summaries as JSON"
     )
     for name in ("plan", "run"):
-        sub = subparsers.add_parser(name)
+        description = (
+            "Offline: generate commands without loading the inference runtime; "
+            "executing them still requires compatible runtime interfaces."
+            if name == "plan" else
+            "Start standard vllm serve commands; test and observe services externally."
+        )
+        sub = subparsers.add_parser(name, help=description, description=description)
         sub.add_argument("--model", choices=("v2-lite", "v4-flash"), default="v2-lite")
         sub.add_argument(
             "--model-path", help="Local checkpoint or HF model ID; required for V4"
@@ -46,7 +52,7 @@ def parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--repo",
             type=Path,
-            help="Defaults to afd-plugin beside this tool directory",
+            help="Optional source path and Git metadata; defaults to the sibling afd-plugin",
         )
         sub.add_argument(
             "--topology",
@@ -178,16 +184,24 @@ def parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--baseline",
             action="store_true",
-            help="Native vLLM-Ascend performance baseline without AFD",
+            help="Native baseline: requires vLLM-Ascend CLI/HTTP interfaces, not afd-plugin",
         )
         sub.add_argument(
             "--vllm-arg",
             action="append",
             default=[],
-            help="Extra token; use --vllm-arg=--flag",
+            help="Serve argument token; replaces the preset option; use --vllm-arg=--flag",
         )
         sub.add_argument("--attention-arg", action="append", default=[])
         sub.add_argument("--ffn-arg", action="append", default=[])
+        sub.add_argument(
+            "--omit-vllm-arg", action="append", default=[],
+            help="Omit a preset serve option and its value, e.g. --omit-vllm-arg=--shutdown-timeout",
+        )
+        sub.add_argument(
+            "--serve-env", action="append", default=[], metavar="NAME=VALUE",
+            help="Override a deployment environment variable for all services",
+        )
     return root
 
 
@@ -214,12 +228,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         case = from_args(args)
         if args.command == "plan":
+            from .planner import describe
+
             result = describe(case)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             if case.run_dir:
                 case.run_dir.mkdir(parents=True, exist_ok=False)
                 write_json(case.run_dir / "plan.json", result)
             return 0
+        from .runner import execute, exit_code
+
         report = execute(case)
         return exit_code(report["status"])
     except (ValueError, RuntimeError, OSError) as exc:

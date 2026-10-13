@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .runner import write_json
+from .reporting import write_json
 from .routing import routes
 
 SEED = 42

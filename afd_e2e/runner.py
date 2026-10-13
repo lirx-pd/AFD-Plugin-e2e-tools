@@ -14,10 +14,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import __version__, coverage, evaluation
+from . import __version__, evaluation
 from .config import TOOL_ROOT, Case
+from .metrics import capture_metrics
 from .planner import Service, build_services, environment, network, runtime_environment
-from .reporting import LOG_FAILURE, is_profiler_advisory, report_text
+from .reporting import LOG_FAILURE, is_profiler_advisory, report_text, write_json
 from .routing import routes
 from .process_utils import (
     close_process_identities,
@@ -25,14 +26,6 @@ from .process_utils import (
     kill_processes_matching_environment,
     terminate_process_groups,
 )
-
-
-def write_json(path: Path, value: dict | list) -> None:
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    temporary.replace(path)
 
 
 def exit_code(status: str) -> int:
@@ -94,8 +87,7 @@ class ManagedProcess:
                                 **({"phase": self.phase} if advisory else {}),
                             }
                         )
-                    if "AFD_E2E_EVENT " not in line:
-                        print(f"[{self.name}] {line}", end="", flush=True)
+                    print(f"[{self.name}] {line}", end="", flush=True)
         except Exception as exc:
             self.reader_error = exc
         finally:
@@ -169,71 +161,49 @@ def source_manifest(case: Case) -> dict:
         str(path.relative_to(TOOL_ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in (TOOL_ROOT / "afd_e2e").rglob("*.py")
     }
-    git = {}
-    for key, arguments in (
-        ("revision", ("rev-parse", "HEAD")),
-        ("status", ("status", "--short")),
-        ("diff", ("diff", "HEAD")),
-    ):
-        try:
-            result = subprocess.run(
-                ("git", "-C", str(case.repo), *arguments),
-                text=True,
-                capture_output=True,
-                timeout=30,
-            )
-            git[key] = result.stdout if result.returncode == 0 else None
-        except (OSError, subprocess.TimeoutExpired):
-            git[key] = None
-    for name in (
-        "afd_plugin/validation.py",
-        "afd_plugin/compat/npu/feature_validation.py",
-        "afd_plugin/v1/worker/npu/ffn_model_runner.py",
-        "afd_plugin/v1/worker/npu/ubatch_runner.py",
-        "afd_plugin/model_executor/models/npu/async_cam_dbo.py",
-        "afd_plugin/model_executor/models/npu/deepseek_v4_shared_experts.py",
-    ):
-        path = case.repo / name
-        if path.is_file():
-            source["afd-plugin/" + name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    git = None
+    if not case.baseline and (case.repo / ".git").exists():
+        git = {}
+        for key, arguments in (
+            ("revision", ("rev-parse", "HEAD")),
+            ("status", ("status", "--short")),
+            ("diff", ("diff", "HEAD")),
+        ):
+            try:
+                result = subprocess.run(
+                    ("git", "-C", str(case.repo), *arguments),
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                git[key] = result.stdout if result.returncode == 0 else None
+            except (OSError, subprocess.TimeoutExpired):
+                git[key] = None
     return {"harness_version": __version__, "source_sha256": source,
-            "afd_plugin": git if not case.baseline else None}
+            "afd_plugin": git}
 
 
 def _preflight_command(case: Case, devices: tuple[str, ...]) -> tuple[str, ...]:
     _, nic = network(case)
+    ports = (
+        tuple(case.api_port + i for i in range(2 * len(case.baseline_layouts)))
+        if case.baseline else (case.api_port, case.api_port + 1, case.afd_port)
+    )
     probe_cmd = [
         case.python,
         "-m",
         "afd_e2e.probe",
-        "--repo",
-        str(case.repo),
         "--model",
         case.model_path,
-        "--family",
-        case.model,
         "--devices",
         ",".join(devices),
         "--api-host",
         case.api_host,
-        "--api-port",
-        str(case.api_port),
-        "--afd-port",
-        str(case.afd_port),
+        "--ports",
+        ",".join(map(str, ports)),
     ]
     if nic:
         probe_cmd.extend(("--nic", nic))
-    if case.comm == "async":
-        probe_cmd.append("--async-cam")
-    if case.layered_gmm:
-        probe_cmd.append("--layered")
-    if case.baseline:
-        probe_cmd.append("--baseline")
-        instances = len(case.baseline_layouts)
-        probe_cmd.extend((
-            "--ports",
-            ",".join(str(case.api_port + i) for i in range(2 * instances)),
-        ))
     return tuple(probe_cmd)
 
 
@@ -280,10 +250,6 @@ def execute(case: Case) -> dict:
         raise ValueError(
             "Specify --device/--devices or inherit ASCEND_RT_VISIBLE_DEVICES "
             "through npu run"
-        )
-    if not case.baseline and not (case.repo / "afd_plugin").is_dir():
-        raise ValueError(
-            f"Sibling afd-plugin not found at {case.repo}; use --repo to override"
         )
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"{timestamp}-{uuid.uuid4().hex[:8]}"
@@ -446,6 +412,9 @@ def execute(case: Case) -> dict:
             services.append(child)
             child.ensure_alive()
         wait_ready(case, services, progress)
+        summary["metrics"] = {
+            "before": capture_metrics(case.to_dict(), run_dir, "before")
+        }
         workload_started = time.time()
         summary["workload_started"] = workload_started
         if case.test == "perf":
@@ -465,10 +434,6 @@ def execute(case: Case) -> dict:
         if case.test in {"smoke", "all"}:
             stage("smoke")
             start_workload("smoke", "smoke")
-        if case.dbo:
-            stage("dbo_workload")
-            # This independent workload never changes the user's GSM8K limit.
-            start_workload("dbo-workload", "coverage")
         if case.test in {"gsm8k", "all"}:
             if case.dataset_path:
                 stage("dataset")
@@ -502,7 +467,6 @@ def execute(case: Case) -> dict:
                 raise
         for service in services:
             service.ensure_alive()
-        # Check coverage after cleanup, when all service logs have drained.
         summary["status"] = "passed"
     except BaseException as exc:
         summary["status"] = (
@@ -514,6 +478,15 @@ def execute(case: Case) -> dict:
         # Complete bounded cleanup even if cancellation is repeated.
         for sig in previous_handlers:
             signal.signal(sig, signal.SIG_IGN)
+        if "metrics" in summary:
+            try:
+                summary["metrics"]["after"] = capture_metrics(
+                    case.to_dict(), run_dir, "after"
+                )
+            except Exception as exc:
+                summary["status"] = "failed"
+                summary.setdefault("failed_stage", "reporting")
+                summary["errors"].append(f"Metrics capture failed: {exc}")
         summary["shutdown_status"] = "running"
         summary["cleanup_status"] = "running"
         summary["inference_status"] = summary["status"]
@@ -538,17 +511,6 @@ def execute(case: Case) -> dict:
             error for error in cleanup_failures if error.startswith("forced SIGKILL")
         ]
         cleanup_failures = [error for error in cleanup_failures if error not in forced]
-        if summary["status"] == "passed":
-            stage("coverage")
-            try:
-                summary["coverage"] = coverage.analyze(
-                    case, run_dir, summary["workload_started"]
-                )
-            except Exception as exc:
-                summary["status"] = "failed"
-                summary["inference_status"] = "failed"
-                summary["failed_stage"] = "coverage"
-                summary["errors"].append(str(exc))
         diagnostics = {service.name: service.diagnostics for service in services}
         summary["log_diagnostics"] = diagnostics
         summary["log_advisories"] = {

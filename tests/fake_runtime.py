@@ -18,35 +18,7 @@ def argument(name):
 
 def service():
     role = os.environ["AFD_E2E_PROCESS_ROLE"]
-    dp = int(argument("--data-parallel-size"))
-    tp = int(argument("--tensor-parallel-size"))
-    config = json.loads(argument("--additional-config")) if "--additional-config" in sys.argv else {}
     activity = Path(os.environ["AFD_E2E_FAKE_ACTIVITY"])
-    mrv = os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
-    layered = os.environ["AFD_E2E_LAYERED_EXPECTED"] == "1"
-    name = (
-        "AFDNPUFFNModelRunner"
-        if role == "ffn"
-        else "AFDNPUAttentionModelRunnerV2"
-        if mrv
-        else "AFDNPUAttentionModelRunner"
-    )
-
-    def emit(kind, **values):
-        for d in range(dp):
-            for t in range(tp):
-                event = {
-                    "time": time.time(),
-                    "run_id": os.environ["AFD_E2E_RUN_ID"],
-                    "role": role,
-                    "kind": kind,
-                    "dp_rank": d,
-                    "tp_rank": t,
-                    "class": name,
-                    **values,
-                }
-                sys.stdout.write("AFD_E2E_EVENT " + json.dumps(event) + "\n")
-                sys.stdout.flush()
 
     def execution():
         if role == "ffn" and os.environ.get("AFD_E2E_FAKE_LIVE_ERROR"):
@@ -57,29 +29,6 @@ def service():
                 else message,
                 flush=True,
             )
-        split = "--enable-dbo" in sys.argv or (
-            "afd" in config and config["afd"]["connector_extra_config"].get(
-                "async_moe_ubatching", False
-            )
-        )
-        emit(
-            "execution",
-            phase="live",
-            mode="replay" if "--compilation-config" in sys.argv else "eager",
-            stages=2 if split else 0,
-        )
-        if role == "attention" and mrv and split:
-            emit(
-                "native_ubatches",
-                phase="live",
-                executor="NPUUBatchRunner",
-                capacity=[4, 4],
-                real=[4, 4],
-            )
-        if layered:
-            emit("layered", phase="live")
-
-    emit("runner", mrv_flag=int(mrv), layered=layered)
     if role == "ffn":
 
         def monitor():
@@ -106,6 +55,23 @@ def service():
             self.wfile.write(encoded)
 
         def do_GET(self):
+            if self.path == "/metrics":
+                if os.environ.get("AFD_E2E_FAKE_NO_METRICS"):
+                    self.send_error(404)
+                    return
+                data = (
+                    '# HELP vllm:num_requests_running Number of running requests.\n'
+                    '# TYPE vllm:num_requests_running gauge\n'
+                    'vllm:num_requests_running{model_name="'
+                    + argument("--served-model-name")
+                    + '"} 0\n'
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             self.send({"data": [{"id": argument("--served-model-name")}]})
 
         def do_POST(self):
@@ -200,8 +166,6 @@ def service():
 if __name__ == "__main__":
     if sys.argv[1] == "service":
         service()
-    elif sys.argv[1] == "preflight":
-        print('AFD_E2E_PROBE {"simulated": true}', flush=True)
     elif sys.argv[1] == "evaluation":
         model_args = dict(
             part.split("=", 1) for part in argument("--model_args").split(",")

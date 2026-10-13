@@ -1,7 +1,8 @@
 # AFD E2E
 
-独立运行的 NPU 测试工具。将 `afd-e2e` 和 `afd-plugin` 放在同级目录，
-使用已有推理环境执行。
+通过标准 `vllm serve` 启动服务、从外部进行请求测试和观测的 NPU 工具。
+可将 `afd-e2e` 和 `afd-plugin` 放在同级目录，使用已有推理环境执行；
+也可直接测试环境中已安装的插件，不要求存在源码 checkout。
 
 ```text
 work/
@@ -14,7 +15,8 @@ work/
 ## 环境与安装
 
 使用 Python 3.10+，以及已经安装 CANN、torch-npu、vLLM、vLLM-Ascend 和 `afd-plugin` 的推理环境；
-自定义 CAM / Layered 算子须在该环境编译安装。工具不改动插件源码。
+所选部署需要的 CAM / Layered 算子和自定义算子路径须由推理环境准备。
+工具不导入插件内部模块、不修改源码、不注入 worker extension 或 monkey patch。
 原生 `--baseline` 只需要现有 vLLM-Ascend 推理环境，不要求安装 `afd-plugin` 或 CAM 算子。
 只查看启动方案无需安装推理或评测依赖：
 
@@ -33,9 +35,44 @@ python -m pip install -e '.[eval]'
 安装在已验证的推理环境中，确认依赖解析不会替换固定版本的 torch / vLLM。
 `python run.py`、`python -m afd_e2e` 和安装后的 `afd-e2e` 是同一个入口。
 从任意工作目录调用源目录中的 `run.py`，默认仍寻找与工具同级的插件。
-插件不在工具同级目录时，用 `--repo` 指定待测 checkout。
+`--repo` 可指定待测 checkout 的顶层 Python 路径和 Git 元数据；该目录不是运行前置条件。
 示例中的 `V4_MODEL` 和 `GSM8K_DATASET` 环境变量分别表示 V4 模型标识或权重位置、离线数据目录，
 使用对应示例前设置。
+
+## 命令与版本依赖边界
+
+所有测试共用外部接口，工具不依赖 AFD runner、connector、ubatching 或算子的 Python 接口。
+部署模板生成的 serve 参数仍需匹配目标环境，`plan` 成功不代表目标版本支持这些参数。
+
+| 命令 | 是否需要上游推理环境 | 依赖边界 |
+| --- | --- | --- |
+| `--help` / `<command> --help`、`plan`、`status`、`pack` | 否 | Python 标准库；生成命令或读取、打包报告 |
+| `python -m afd_e2e.performance --config ...` | 客户端无需安装 | 已有服务的 HTTP/SSE 协议及 `httpx` |
+| `python -m afd_e2e.workloads --config ... --kind smoke --output ...` | 客户端无需安装 | 已有服务的 completions/chat API 及 `httpx` |
+| `run --baseline` | 服务端需要，不需要 afd-plugin | 原生 `vllm serve` 参数、HTTP、日志和进程生命周期 |
+| AFD `run --test smoke` / `run --test perf` | 服务端需要，包含 afd-plugin | A/F 的 `vllm serve` 启动参数与环境；测试端使用 HTTP、日志及可选 `/metrics` |
+| AFD `run --test gsm8k` / `run --test all` | 服务端需要，包含 afd-plugin | 上述部署与外部接口，加固定 lm-eval/GSM8K 评测依赖 |
+
+HTTP 客户端可在另一 Python 环境运行，但服务端仍有自身的版本要求。
+性能接口需要 `/tokenize`、`/v1/completions`、完整 SSE、准确 token usage 及所用
+请求参数支持；原生多 DP 路由还要求服务端接受 `X-data-parallel-rank`。
+因此客户端不依赖源码版本，仍需服务端满足这些 HTTP 契约。
+
+`run` 不硬编码允许的 vLLM/Ascend/AFD commit 列表，也不会自动安装或升级它们。
+同级或 `--repo` 指定的 checkout 的 Git commit/工作树状态写入
+`manifest.json` 的 `afd_plugin`；缺少 checkout 时记为 null。
+目标 `--python` 环境中已安装的包版本通过 `importlib.metadata` 写入
+`readiness.versions`，缺包记为 null，不导入推理包，也不核对内部源码位置。
+Git 元数据描述所选 checkout，包版本描述所选 Python 环境，二者不构成实际导入来源证明。
+
+适配不同版本时调整部署模板的 serve 参数和运行环境，或使用下述附加参数覆盖；
+HTTP 测试、性能计算和验收规则无需跟随私有类名、字段或算子接口变化。
+MRV、DBO、Graph 和 Layered 的实际支持情况由目标服务验证。
+这些功能的配置会保存，但 HTTP 成功不能证明某个内部 executor 或 kernel 实际执行。
+
+直接 HTTP 发压复用已生成的 `resolved-config.json`，要求目标服务已启动且模型名、
+地址及域映射与配置一致。性能客户端在配置所在目录创建新结果，不覆盖已有
+`performance/`，不执行 `run` 的预检、服务启动、观测快照或服务清理。
 
 ## 设备管理与启动
 
@@ -113,27 +150,22 @@ python run.py run --device 0,1,2,3 --topology 2a2f --test smoke
 | `--test` | `smoke` / `gsm8k` / `all` / `perf`；AFD 默认 all（smoke + GSM8K），baseline 默认 perf |
 | `--device` / `--devices` | 逗号分隔的设备编号；也可继承 `ASCEND_RT_VISIBLE_DEVICES` |
 
-### 功能组合限制
+### 功能配置与验收边界
 
-工具在预检和服务启动前校验组合限制：Async CAM 仅支持 eager；同步和异步均可开启原生 DBO。
-DBO 要求 FFN MRV1，Attention 可选 MRV1 / MRV2，MRV2 DBO 要求 eager。
-MRV2 原生双微批需满足当前插件对 Attention DP 和拓扑的限制。
-Layered GMM 要求 V4、async、eager、dynamicQuant=1 和 A3/910C
-及 W4A8 权重，FFN MRV1 / MRV2 均可开启。FFN 的实际类名为
-`AFDNPUFFNModelRunner`，报告同时记录 MRV 开关及实际执行的 Layered 算子。
+MRV、DBO、Graph、Layered GMM 和 Async CAM 的组合通过 serve 参数及启动环境表达，
+工具不复制某个插件版本的内部功能限制。目标版本拒绝配置、服务退出或日志报错时，测试失败。
+`plan` 中的这些配置表示请求的部署模板，不是已验证的内部执行路径。
 
-DBO 开启时会额外发出并发覆盖请求，不增加 GSM8K 的 `--limit`。
-MRV2 DBO 的覆盖检查还要求每个 Attention rank 记录真实 `NPUUBatchRunner`
-执行、两段容量与各段实际 token 数；配置开关本身不能充当执行证据。
-`--moe-ubatching` 对应异步 CAM 自身的拆分机制，不能用原生 DBO 开关替代。
-比较 MRV2 的 DBO on / off 时，两组均显式设置 `--moe-ubatching off`，只改变 `--dbo`；
-否则异步默认开启的拆分仍会触发双微批。Async DBO 只在 Attention 开启原生 DBO，FFN 消费 CAM 工作项。
+`--moe-ubatching` 仅配置异步 CAM 模板，`--dbo` 对应原生 DBO，原生 baseline 也可使用。
+比较 DBO on / off 时应保持其他启动条件一致；例如明确设置 `--moe-ubatching off`。
+工具不为 DBO 额外添加覆盖负载，性能请求数和 GSM8K `--limit` 保持用户指定值。
 `--baseline` 使用原生 vLLM-Ascend，支持下面的 DP 实例组合，默认进行性能测试。
 
 ### 原生 DP 性能基线
 
 复用当前环境和依赖版本，以 `--baseline` 启用；服务不注册 AFD 插件，不传 AFD
 角色配置或 worker extension。支持一个 DP-N 实例和多个不同大小的 DP 实例。
+OMP 默认 8 线程，也可继承调用方的 `OMP_NUM_THREADS`。
 `dpN` 的默认 TP 为 V2 Lite 的 1、V4 Flash 的 4；也可用 `dpNtpM` 显式指定。
 默认拓扑分别为 `dp4tp1` 和 `dp2tp4`。原生 MoE 服务沿用 `--enable-expert-parallel`。
 
@@ -189,7 +221,30 @@ DP RPC 端口从 `api-port + 实例数` 起分配。启动检查等待全部实�
 `--memory-utilization` 校准；graph 的 `--capture-sizes` 默认 `1,2,4,8,16`。
 其他 vLLM 参数按单个 token 传入，例如 `--vllm-arg=--block-size --vllm-arg=128`，
 也可只给 Attention / FFN 传 `--attention-arg` / `--ffn-arg`。
-核心拓扑和功能参数由工具统一管理，不能通过附加参数覆盖。
+同名附加参数替换模板参数及其值，布尔选项同时移除相反的 `--no-...` / `--...`；
+角色参数优先于公共参数。`--additional-config` 整体替换 JSON，须包含该角色所需的完整配置。
+`--omit-vllm-arg=--flag` 移除两侧模板中的选项及其值，适用于目标版本没有该参数的情况。
+随后显式传入的参数仍会加入命令。
+插件入口等启动环境可用 `--serve-env NAME=VALUE` 覆盖模板；其他环境变量沿用调用方。
+设备可见性、进程归属标记和工具 Python 路径由工具管理，不能覆盖。
+HTTP host/port、served model、DP/TP、DP RPC 端口及负载长度/内存配置仍由专用参数管理，
+保证设备分配和请求配置一致；支持情况交给目标 `vllm serve` 判定。
+
+```bash
+# Replace a version-specific compilation preset and remove an unavailable CLI option.
+python run.py plan --execution graph \
+  --vllm-arg=--compilation-config '--vllm-arg={"mode":0}' \
+  --omit-vllm-arg=--shutdown-timeout
+
+# Supply complete role-specific AFD JSON for the version being tested.
+python run.py plan \
+  --attention-arg=--additional-config --attention-arg="$ATTENTION_CONFIG" \
+  --ffn-arg=--additional-config --ffn-arg="$FFN_CONFIG"
+```
+
+`ATTENTION_CONFIG` / `FFN_CONFIG` 为目标版本接受的完整 JSON 字符串。
+`manifest.services` 和 `commands.json` 保存实际生效的命令；功能开关字段描述原始模板，
+存在覆盖时以实际命令为准。自定义算子路径沿用调用方环境，不猜测插件源码内的 vendor 路径。
 
 ## 测试用例
 
@@ -344,12 +399,13 @@ TPOT 和 `output_tokens_per_second`。decode 请求仍包含单 token 输入的 
 结果默认写入 `runs/<唯一运行编号>/`，或指定新的 `--output` 目录：
 
 - `resolved-config.json`、`commands.json`：配置、启动命令与环境。
-- `manifest.json`：工具 / 插件源文件哈希、插件 Git 状态、分配设备、模型元数据和依赖版本。
+- `manifest.json`：工具源文件哈希、可选插件 Git 状态、实际命令、域映射、分配设备、模型元数据和包版本。
 - `preflight.log`、`attention.log`、`ffn.log`、评测日志：原始输出。
-- `smoke.json`、`dbo-workload.json`：请求、响应及错误。
+- `smoke.json`：请求、响应及错误。
 - `gsm8k/`：lm-eval 原始结果和逐条样本；精确校验数量和 strict-match。
 - `performance.json`、`performance/requests.jsonl`：性能汇总及逐请求原始测量。
-- `coverage.json`：所有预期 rank 的实际 MRV、live graph / 双段拆分 / Layered 执行证据。
+- `metrics/before-*.prom`、`metrics/after-*.prom`：各 HTTP 实例在负载前后的 `/metrics` 原始快照。
+  `summary.metrics` 记录每次采集的状态、路径或不可用原因；指标名称按服务端版本原样保留。
 - `report.txt`：简短结果，包含精度、条数、阈值、耗时及失败原因，结束时也输出到终端。
 - `diagnostics.json`：Attention / FFN 按推理和退出阶段记录错误，附原始日志文件名与行号；
   每个角色、阶段最多 20 条，超过时保留最早 10 条和最新 10 条，避免重复消息挤掉后面的根因。
@@ -371,9 +427,13 @@ profiler 的已知完整提示 “daemon process 中不能解析，请使用 off
 不触发服务故障判定；仍须完成 profiler 的离线解析。其他 profiler 错误、NPU / 算子错误和退出异常均判失败，
 同一行混入其他错误时也不会被当成提示。退出、进程清理和报告写入失败都有明确的 `failed_stage`。
 
-工具先检查端口和网卡，再检查来源、可见 NPU、矩阵运算、模型文件及同步 / 异步算子，最后启动服务。
+预检检查端口、网卡和本地模型文件，记录包版本；远程模型加载、设备可用性和算子支持由服务启动检查。
 端口检查允许上次连接留下的 TIME_WAIT，但仍拒绝已有监听服务。
-不能用启动成功替代功能执行证据；只在实际请求完成后统计覆盖。
+服务就绪通过 `/v1/models` 判断；smoke 检查并发请求和有效响应，GSM8K 检查精度与样本数，
+性能测试检查完整流式响应和 usage。日志错误、异常退出和清理失败继续判失败。
+`/metrics` 在负载前后采集，不在测量请求过程中轮询；404、超时等记录为 unavailable，不影响测试结果。
+工具不解析版本相关的 Prometheus 指标，也不推断内部 Graph、DBO 或 Layered 执行覆盖。
+profiler 可通过目标版本的 serve 参数启用，trace 收集和离线解析由外部工具完成。
 每次输出目录必须是新目录，避免误读旧精度结果。
 
 ### 批量查看状态
@@ -388,7 +448,7 @@ python run.py status runs/async-off runs/async-dbo-on --json
 
 可传一个运行目录、多个运行目录，或包含多次运行的父目录；父目录只扫描直接子目录，
 不遍历模型、profiler 或转储文件。表格显示运行目录、Case 配置、整体结果、阶段、推理 / 退出 / 清理状态、
-覆盖、GSM8K 分数与条数、性能状态及耗时。运行中的测试显示当前阶段；退出失败显示 shutdown。
+GSM8K 分数与条数、性能状态及耗时。运行中的测试显示当前阶段；退出失败显示 shutdown。
 历史报告缺少 `failed_stage` 时按已有阶段状态显示失败位置，不改动历史文件。
 `--json` 返回完整汇总及实际读取的 `result_dir`，用于已有批量脚本。
 `status` 读取成功返回 0，目录无结果或报告损坏返回 2；测试是否通过仍查看汇总内的状态。
@@ -407,12 +467,12 @@ python run.py pack runs/<运行编号> --compact
 
 默认生成 `results.tar.gz` 和对应 `.sha256` 校验文件，不覆盖已有文件。
 压缩包保留根目录的 JSON / 日志 / 文本报告、GSM8K 结果、逐条样本和本地任务配置，
-以及性能测试的逐请求数据；
+以及性能测试的逐请求数据和外部 metrics 快照；
 `extra-info` 等目录的大型 NPU 转储不加入压缩包，原文件保留。
 包内 `archive-inventory.json` 记录收录 / 排除文件的路径和大小，终端输出排除总大小与 SHA256。
 文件及目录符号链接不打包。iTask 的 Pod 创建、文件传输继续由外部操作完成。
 
-`--compact` 默认生成 `reports.tar.gz`，省去完整的 Attention / FFN 日志，保留其他报告、
+`--compact` 默认生成 `reports.tar.gz`，省去完整的 Attention / FFN / baseline 实例日志，保留其他报告、
 评测日志和逐请求数据。包内 `log-evidence.json` 保存原日志的字节数、行数、SHA256、
 每条采样错误 / 提示前 8 行后 40 行的上下文，以及末尾 40 行；方便直接定位算子错误和 traceback。
 它在打包时生成，原日志和历史汇总不修改；已下载的 `log-evidence.json` 原样收录。
@@ -425,11 +485,12 @@ python -m pip install -e '.[test]'
 python -m pytest -q
 ```
 
-测试涵盖参数组合、设备选择与环境继承、精确样本数、严格精度门禁、运行证据、取消及进程清理、
+测试涵盖参数组合、设备选择与环境继承、精确样本数、严格精度门禁、外部观测、取消及进程清理、
 退出报错但进程返回 0、报告写入失败、双模式 V4 答案校验及转储排除打包；
 性能测试覆盖长度 / 并发 / RPS 矩阵、混合和突发到达、分块解析、指标计算、并发限制、
 完整请求超时、预热失败、取消时的部分结果，以及 V4 同步 / 异步生命周期；
 还覆盖 async+DBO 中 profiler 提示不打断请求、真正错误仍失败、后续根因采样、小体积打包和批量状态读取；
+还覆盖 serve 参数替换/移除、内部功能支持判定委托、无推理包导入的预检、可选 metrics 和原生多实例日志打包；
 生命周期测试使用本地模拟 HTTP 服务和真实子进程，需允许 localhost socket。
 这些 CPU 测试不能代替真实 NPU / 模型评测。
 

@@ -22,6 +22,14 @@ PROFILER_PARSE_ADVISORY = (
 )
 
 
+def write_json(path: Path, value: dict | list) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
 def is_profiler_advisory(line: str) -> bool:
     # Offline export is required; this message does not report an inference failure.
     return (
@@ -33,9 +41,14 @@ def is_profiler_advisory(line: str) -> bool:
 
 def log_evidence(run_dir: Path, summary: dict) -> dict:
     result = {"logs": {}, "excerpts": {}}
-    for role in ("attention", "ffn"):
-        path = run_dir / f"{role}.log"
-        if not path.is_file() or path.is_symlink():
+    roles = {"attention", "ffn", *summary.get("log_diagnostics", {}),
+             *summary.get("log_advisories", {})}
+    for path in sorted(run_dir.glob("*.log")):
+        role = path.stem
+        if (
+            (role not in roles and not role.startswith("baseline-"))
+            or not path.is_file() or path.is_symlink()
+        ):
             continue
         errors = [
             error
@@ -91,8 +104,13 @@ def report_text(summary: dict) -> str:
             f"GSM8K: {score['strict_match']:.2%}, samples={score['samples']}, "
             f"threshold={score['threshold']:.2%}"
         )
-    if evidence := summary.get("coverage"):
-        lines.append(f"Coverage: {evidence['status']}")
+    if snapshots := summary.get("metrics"):
+        captured = sum(
+            item["status"] == "captured"
+            for endpoints in snapshots.values() for item in endpoints.values()
+        )
+        total = sum(len(endpoints) for endpoints in snapshots.values())
+        lines.append(f"Metrics: {captured}/{total} snapshots captured; see metrics/")
     if performance := summary.get("performance"):
         lines.append(
             f"Performance: {performance['status']} (client ms; see performance.json)"
@@ -163,7 +181,6 @@ def status_text(reports: list[dict]) -> str:
             "Inference",
             "Shutdown",
             "Cleanup",
-            "Coverage",
             "GSM8K",
             "Perf",
             "Elapsed",
@@ -196,7 +213,6 @@ def status_text(reports: list[dict]) -> str:
                         "cleanup_status",
                     )
                 ),
-                (report.get("coverage") or {}).get("status") or "-",
                 f"{score['strict_match']:.2%} ({score['samples']})" if score else "-",
                 (report.get("performance") or {}).get("status") or "-",
                 f"{elapsed:.1f}s" if elapsed is not None else "-",
@@ -240,10 +256,16 @@ def pack(run_dir: Path, output: Path | None = None, *, compact: bool = False) ->
         ) or (
             relative.parts[0] in {"gsm8k", "gsm8k-task", "performance"}
             and path.suffix in {".json", ".jsonl", ".yaml"}
+        ) or (
+            relative.parts[0] == "metrics" and path.suffix == ".prom"
         )
         include = (
             owned_output
-            and not (compact and relative.name in {"attention.log", "ffn.log"})
+            and not (compact and (
+                relative.name in {"attention.log", "ffn.log"}
+                or (len(relative.parts) == 1 and relative.name.startswith("baseline-")
+                    and path.suffix == ".log")
+            ))
             and not path.is_symlink()
             and path.resolve().is_relative_to(run_dir)
         )

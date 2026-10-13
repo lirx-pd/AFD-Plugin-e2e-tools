@@ -75,7 +75,6 @@ def environment(
         "ASCEND_RT_VISIBLE_DEVICES": ",".join(devices),
         "AFD_E2E_RUN_ID": run_id,
         "AFD_E2E_PROCESS_ROLE": role,
-        "AFD_E2E_LAYERED_EXPECTED": str(int(case.layered_gmm and role == "ffn")),
         "AFD_ASYNC_CAM_LAYERED_GMM": str(int(case.layered_gmm and role == "ffn")),
         "PYTHONPATH": os.pathsep.join(
             filter(None, (
@@ -94,7 +93,7 @@ def environment(
         "VLLM_RPC_TIMEOUT": "3600000",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "30000",
         "VLLM_ENGINE_READY_TIMEOUT_S": str(int(case.startup_timeout)),
-        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "10"),
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "8" if case.baseline else "10"),
         "OMP_PROC_BIND": "false",
         "AFD_FORCE_BALANCED_TOPK_IDS": "0",
         "AFD_CAM_OP_IO_LOG": "0",
@@ -119,30 +118,14 @@ def environment(
                 "TASK_QUEUE_ENABLE": "1",
             }
         )
-    if case.dbo:
-        env["VLLM_LOGGING_LEVEL"] = "DEBUG"
-    vendor = case.repo / "afd_plugin/_cann_ops_custom/vendors/afd-plugin"
-    if not case.baseline and vendor.is_dir():
-        # CANN caches operator configurations during its first initialization.
-        # The connector's later loader cannot make Layered GMM visible then.
-        env["ASCEND_CUSTOM_OPP_PATH"] = os.pathsep.join(
-            filter(None, (str(vendor), os.environ.get("ASCEND_CUSTOM_OPP_PATH")))
-        )
     if case.offline:
         env.update({"HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1"})
+    env.update(assignment.split("=", 1) for assignment in case.serve_env)
     return env
 
 
 def runtime_environment(service: Service) -> dict[str, str]:
     env = os.environ.copy()
-    for name in (
-        "AFD_PLUGIN_EARLY_ENGINE_PATCH",
-        "VLLM_ASCEND_ENABLE_FLASHCOMM1",
-    ):
-        env.pop(name, None)
-    # The sync connector sizes its own domains; do not inherit Async CAM buffers.
-    if "HCCL_BUFFSIZE" not in service.environment:
-        env.pop("HCCL_BUFFSIZE", None)
     env.update(service.environment)
     return env
 
@@ -233,8 +216,6 @@ def _service_command(
         command.extend(
             ("--additional-config", json.dumps(config, separators=(",", ":")))
         )
-    if not case.baseline:
-        command.extend(("--worker-extension-cls", "afd_e2e.observer.Worker"))
     if case.execution == "eager":
         command.append("--enforce-eager")
     else:
@@ -297,9 +278,35 @@ def _service_command(
                 "flashinfer_all2allv" if ffn else "allgather_reducescatter",
             )
         )
-    command.extend(case.common_args)
-    command.extend(case.ffn_args if ffn else case.attention_args)
+    for option in case.omit_args:
+        command = _without_option(command, option)
+    for arguments in (case.common_args, case.ffn_args if ffn else case.attention_args):
+        for token in arguments:
+            if token.startswith("--"):
+                option = token.split("=", 1)[0]
+                command = _without_option(command, option)
+                opposite = (
+                    "--" + option[5:] if option.startswith("--no-")
+                    else "--no-" + option[2:]
+                )
+                command = _without_option(command, opposite)
+        command.extend(arguments)
     return tuple(command)
+
+
+def _without_option(command: list[str], option: str) -> list[str]:
+    result = []
+    index = 0
+    while index < len(command):
+        token = command[index]
+        if token.split("=", 1)[0] == option:
+            index += 1
+            while index < len(command) and not command[index].startswith("--"):
+                index += 1
+        else:
+            result.append(token)
+            index += 1
+    return result
 
 
 def build_services(
@@ -378,7 +385,8 @@ def describe(case: Case) -> dict:
             ffn={"ranks": case.ffn_ranks, "dp": case.ffn_ranks,
                  "tp": 1, "ep": case.ffn_ranks},
         )
-        result["notes"].append(
-            "NPU FFN uses AFDNPUFFNModelRunner for both MRV flags; coverage checks the flag and actual Layered GMM calls"
-        )
+    result["notes"].append(
+        "Tests use HTTP responses, client timings, service logs and optional /metrics; "
+        "internal runner, graph, splitting and kernel execution are not verified"
+    )
     return result

@@ -1,15 +1,11 @@
 import asyncio
-import builtins
 import io
 import json
-import sys
-from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import httpx
 import pytest
 
-from afd_e2e import performance, probe, runner, workloads
+from afd_e2e import performance, runner, workloads
 from afd_e2e.planner import build_services, describe
 from afd_e2e.routing import routes
 
@@ -69,40 +65,6 @@ def test_baseline_device_and_port_boundaries(make_case):
         make_case("--baseline", "--topology", "dp1,dp1", "--api-port", "65533")
     case = make_case("--baseline", "--topology", "dp1,dp1", "--api-port", "65532")
     assert case.required_devices == 2
-
-
-def test_native_preflight_does_not_import_afd(monkeypatch, tmp_path):
-    check_ports = MagicMock()
-    monkeypatch.setattr(probe, "check_ports", check_ports)
-    torch = MagicMock()
-    torch.npu.device_count.return_value = 2
-    torch.testing.assert_close = MagicMock()
-    for name, module in {
-        "torch": torch, "torch_npu": SimpleNamespace(),
-        "vllm": SimpleNamespace(__file__="/native/vllm/__init__.py"),
-        "vllm_ascend": SimpleNamespace(),
-    }.items():
-        monkeypatch.setitem(sys.modules, name, module)
-    original_import = builtins.__import__
-
-    def native_import(name, *args, **kwargs):
-        assert not name.startswith("afd_plugin")
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", native_import)
-    model = tmp_path / "model"
-    model.mkdir()
-    (model / "config.json").write_text('{"model_type":"deepseek_v2"}')
-    (model / "tokenizer_config.json").write_text("{}")
-    (model / "model.safetensors").write_bytes(b"fixture")
-    args = SimpleNamespace(
-        ports=[19280, 19281, 19282, 19283], api_host="127.0.0.1",
-        api_port=19280, afd_port=6455, nic=None, repo="/missing",
-        baseline=True, devices="0,1", model=str(model), family="v2-lite",
-        async_cam=False, layered=False,
-    )
-    assert probe.probe(args)["afd_source"] is None
-    check_ports.assert_called_once_with("127.0.0.1", tuple(args.ports))
 
 
 def test_all_native_instances_must_be_ready(make_case, monkeypatch):
