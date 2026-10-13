@@ -6,6 +6,8 @@ import argparse
 import hashlib
 import json
 import math
+import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .config import Case
@@ -83,6 +85,67 @@ def command(case: Case, run_dir: Path) -> tuple[str, ...]:
     return tuple(cmd)
 
 
+def sample_diagnostics(output: Path, expected_count: int, score: float) -> dict:
+    files = list(output.rglob("samples_gsm8k*.jsonl"))
+    if len(files) != 1:
+        return {"sample_details_unavailable": f"Expected one GSM8K sample log; found {len(files)}"}
+    failures, scores, doc_ids = [], [], set()
+    mismatch_count = equivalent_count = 0
+    try:
+        with files[0].open(encoding="utf-8") as stream:
+            for line in stream:
+                sample = json.loads(line)
+                if sample.get("filter") not in {None, "strict-match"}:
+                    continue
+                match = sample.get("exact_match,strict-match")
+                if match is None:
+                    match = sample.get("exact_match")
+                    if isinstance(match, dict):
+                        match = match.get("strict-match")
+                    elif sample.get("filter") != "strict-match":
+                        continue
+                if match not in (0, 1) or sample["doc_id"] in doc_ids:
+                    raise ValueError("Invalid or duplicate strict-match sample")
+                doc_ids.add(sample["doc_id"])
+                scores.append(match)
+                if match:
+                    continue
+                target = str(sample["target"])
+                answers = re.findall(r"####\s*([^\r\n]+)", target)
+                expected = (answers[-1] if answers else target).strip()
+                extracted = sample["filtered_resps"]
+                if isinstance(extracted, dict):
+                    extracted = extracted["strict-match"]
+                while isinstance(extracted, list):
+                    extracted = extracted[0] if extracted else ""
+                extracted = str(extracted).strip()
+                try:
+                    numbers = [Decimal(v.replace(",", "").replace("$", ""))
+                               for v in (expected, extracted)]
+                    equivalent = all(v.is_finite() for v in numbers) and numbers[0] == numbers[1]
+                except InvalidOperation:
+                    equivalent = False
+                mismatch_count += 1
+                equivalent_count += int(equivalent)
+                if len(failures) < 20:
+                    response = sample.get("resps", "")
+                    while isinstance(response, list):
+                        response = response[0] if response else ""
+                    failures.append({
+                        "doc_id": sample["doc_id"], "expected": expected,
+                        "extracted": extracted, "numeric_equivalent": equivalent,
+                        "output_excerpt": str(response)[-400:],
+                    })
+        if not scores or len(scores) != expected_count or not math.isclose(sum(scores) / len(scores), score):
+            raise ValueError("Sample log does not match the official count/score")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        return {"sample_details_unavailable": f"{files[0]}: {exc}"}
+    return {
+        "sample_file": str(files[0]), "mismatch_count": mismatch_count,
+        "numeric_equivalent_mismatches": equivalent_count, "mismatches": failures,
+    }
+
+
 def read_results(output: Path, expected_count: int, threshold: float) -> dict:
     files = list(output.rglob("results_*.json"))
     if not files:
@@ -107,6 +170,7 @@ def read_results(output: Path, expected_count: int, threshold: float) -> dict:
         "strict_match": score,
         "threshold": threshold,
         "result_file": str(files[0]),
+        **sample_diagnostics(output, expected_count, score),
     }
     if score < threshold:
         raise AccuracyError(metrics)

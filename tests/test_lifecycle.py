@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from afd_e2e import planner, runner
+from afd_e2e import cli, planner, runner
 from afd_e2e.reporting import PROFILER_PARSE_ADVISORY
 from afd_e2e.process_utils import (
     kill_processes_matching_environment,
@@ -210,6 +210,98 @@ def test_accuracy_failure_still_cleans_up_children(
     assert "GSM8K: 10.00%" in (Path(summary["run_dir"]) / "report.txt").read_text()
     assert summary["cleanup_status"] == "passed"
     assert all(code is not None for code in summary["process_exit_codes"].values())
+
+
+def test_plan_then_run_reuses_directory_but_never_overwrites_results(
+    make_case, simulated_runtime, capsys
+):
+    flags = [*simulated_runtime, "--device", "0,1,2,3", "--test", "smoke"]
+    assert cli.main(["plan", *flags]) == 0
+    assert cli.main(["plan", *flags]) == 0
+    capsys.readouterr()
+    case = make_case(*flags)
+    plan = (case.run_dir / "plan.json").read_bytes()
+    summary = runner.execute(case)
+    assert summary["status"] == "passed", summary["errors"]
+    assert (case.run_dir / "plan.json").read_bytes() == plan
+    saved = (case.run_dir / "summary.json").read_bytes()
+    with pytest.raises(FileExistsError, match="Output must be new"):
+        runner.execute(case)
+    assert cli.main(["plan", *flags]) == 2
+    assert (case.run_dir / "summary.json").read_bytes() == saved
+
+
+@pytest.mark.parametrize("score", ["0.5", "0.1"])
+def test_combined_workloads_start_services_once_even_below_accuracy_threshold(
+    make_case, simulated_runtime, monkeypatch, score
+):
+    monkeypatch.setenv("AFD_E2E_FAKE_SCORE", score)
+    case = make_case(
+        *simulated_runtime, "--device", "0,1,2,3", "--test", "all,perf",
+        "--perf-mode", "matrix", "--perf-input-lens", "8",
+        "--perf-output-lens", "4", "--perf-concurrencies", "2",
+        "--perf-requests", "2", "--perf-warmup", "0",
+    )
+    summary = runner.execute(case)
+    expected = "passed" if score == "0.5" else "failed"
+    assert summary["status"] == summary["inference_status"] == expected
+    assert summary["test_results"] == {"smoke": "passed", "gsm8k": expected, "perf": "passed"}
+    assert summary["performance"]["points"][0]["completed"] == 2
+    assert summary["shutdown_status"] == summary["cleanup_status"] == "passed"
+    commands = json.loads((case.run_dir / "commands.json").read_text())
+    assert [row["role"] for row in commands if "role" in row] == ["ffn", "attention"]
+    assert [row["name"] for row in commands if "name" in row] == ["preflight", "smoke", "evaluation", "performance"]
+    assert all(code is not None for code in summary["process_exit_codes"].values())
+
+
+def test_combined_workloads_abort_after_smoke_failure(
+    make_case, simulated_runtime, local_v4_weights, monkeypatch
+):
+    monkeypatch.setenv("AFD_E2E_FAKE_WRONG_ANSWER", "1")
+    case = make_case(
+        *simulated_runtime, "--model", "v4-flash", "--model-path", local_v4_weights,
+        "--device", ",".join(map(str, range(16))), "--test", "all,perf",
+    )
+    summary = runner.execute(case)
+    assert summary["status"] == "failed" and summary["failed_stage"] == "smoke"
+    assert summary["test_results"] == {"smoke": "failed", "gsm8k": "not_started", "perf": "not_started"}
+    assert "performance" not in summary
+    assert summary["cleanup_status"] == "passed"
+
+
+def test_native_baseline_combines_smoke_and_performance(make_case, simulated_runtime):
+    case = make_case(
+        *simulated_runtime, "--baseline", "--topology", "dp1,dp2", "--device", "0,1,2",
+        "--test", "smoke,perf", "--perf-mode", "matrix", "--perf-input-lens", "8",
+        "--perf-output-lens", "4", "--perf-concurrencies", "2",
+        "--perf-requests", "2", "--perf-warmup", "0",
+    )
+    summary = runner.execute(case)
+    assert summary["status"] == "passed", summary["errors"]
+    assert summary["test_results"] == {"smoke": "passed", "perf": "passed"}
+    assert summary["performance"]["points"][0]["completed"] == 2
+    commands = json.loads((case.run_dir / "commands.json").read_text())
+    assert [row["role"] for row in commands if "role" in row] == ["baseline-0", "baseline-1"]
+    assert summary["cleanup_status"] == "passed"
+
+
+def test_shutdown_summary_retains_root_outside_bounded_log_samples(
+    make_case, simulated_runtime, monkeypatch
+):
+    root = "RuntimeError: AFD NPU FFN worker loop did not stop after connector close"
+    fault = "\n".join([
+        *("ERROR WorkerProc hit an exception" for _ in range(50)),
+        root,
+        *("ERROR repeated worker wrapper" for _ in range(50)),
+    ])
+    monkeypatch.setenv("AFD_E2E_FAKE_SHUTDOWN_ERROR", fault)
+    case = make_case(*simulated_runtime, "--device", "0,1,2,3", "--test", "smoke")
+    summary = runner.execute(case)
+    assert summary["shutdown_status"] == "failed" and summary["cleanup_status"] == "passed"
+    assert any(root in message for message in summary["errors"])
+    assert root in (case.run_dir / "report.txt").read_text()
+    evidence = next(row for row in summary["log_diagnostics"]["ffn"]["shutdown"] if root in row["message"])
+    assert (case.run_dir / "ffn.log").read_text().splitlines()[evidence["line"] - 1] == root
 
 
 @pytest.mark.parametrize(

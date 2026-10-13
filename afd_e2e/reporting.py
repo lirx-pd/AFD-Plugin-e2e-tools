@@ -16,10 +16,33 @@ LOG_FAILURE = re.compile(
     r"\b\w*(?:Error|Exception):|\[ERROR\]|\bERROR\s"
     r"|force killing|sending SIGKILL|forced SIGKILL"
 )
+ROOT_EXCEPTION = re.compile(r"\b[\w.]*(?:Error|Exception):[^\r\n]*")
 PROFILER_PARSE_ADVISORY = (
     "The profiling data cannot be parsed during the daemon process, "
     "it is recommended that you use an offline parsing interface to parse the collected data."
 )
+
+
+def prepare_output_directory(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        plan = path / "plan.json"
+        if (
+            not path.is_dir() or path.is_symlink()
+            or list(path.iterdir()) != [plan]
+            or plan.is_symlink() or not plan.is_file()
+        ):
+            raise FileExistsError(
+                f"Output must be new or contain only a regular plan.json: {path}"
+            ) from None
+
+
+def primary_error(evidence: list[dict]) -> dict:
+    return next(
+        (row for row in evidence if ROOT_EXCEPTION.search(row["message"])),
+        evidence[0],
+    )
 
 
 def write_json(path: Path, value: dict | list) -> None:
@@ -99,11 +122,28 @@ def report_text(summary: dict) -> str:
         f"Elapsed: {summary['elapsed_seconds']:.1f}s",
         f"Output: {summary['run_dir']}",
     ]
+    if tests := summary.get("test_results"):
+        lines.append("Tests: " + "; ".join(f"{name}={status}" for name, status in tests.items()))
     if score := summary.get("gsm8k"):
         lines.append(
             f"GSM8K: {score['strict_match']:.2%}, samples={score['samples']}, "
             f"threshold={score['threshold']:.2%}"
         )
+        if score.get("mismatch_count"):
+            lines.append(
+                f"GSM8K mismatches: {score['mismatch_count']}; "
+                f"numeric-equivalent formatting differences: {score['numeric_equivalent_mismatches']} "
+                "(diagnostic only; strict-match unchanged)"
+            )
+            for failure in score["mismatches"][:5]:
+                lines.append(
+                    f"  doc_id={failure['doc_id']} expected={failure['expected']!r} "
+                    f"extracted={failure['extracted']!r} "
+                    f"numeric_equivalent={failure['numeric_equivalent']}; "
+                    f"output_tail={failure['output_excerpt']!r}"
+                )
+        if note := score.get("sample_details_unavailable"):
+            lines.append(f"GSM8K sample details unavailable: {note}")
     if snapshots := summary.get("metrics"):
         captured = sum(
             item["status"] == "captured"
@@ -134,6 +174,22 @@ def report_text(summary: dict) -> str:
                 lines[-1] += f" {name.upper()} mean/p50/p95/p99={formatted}"
             rate = point.get("achieved_rps")
             lines[-1] += f" completed RPS={rate:.3f}" if rate is not None else ""
+            if mix := point.get("planned_mix"):
+                lines.append("  Planned lengths: " + ", ".join(
+                    f"{row['input_tokens']}/{row['output_tokens']}={row['requests']} "
+                    f"({row['ratio']:.1%})" for row in mix
+                ))
+            if actual := point.get("by_length"):
+                lines.append("  Actual lengths (input/output=passed/failed/cancelled): " + ", ".join(
+                    f"{row['input_tokens']}/{row['output_tokens']}="
+                    f"{row['completed']}/{row['failed']}/{row['cancelled']}" for row in actual
+                ))
+    warnings = dict.fromkeys((
+        *summary.get("warnings", []),
+        *(warning for point in (summary.get("performance") or {}).get("points", [])
+          for warning in point.get("warnings", [])),
+    ))
+    lines.extend(f"Warning: {warning}" for warning in warnings)
     if summary.get("failed_stage"):
         lines.append(f"Failed stage: {summary['failed_stage']}")
     lines.extend(f"Error: {error}" for error in summary["errors"])

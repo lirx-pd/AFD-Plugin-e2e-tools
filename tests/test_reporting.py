@@ -188,6 +188,23 @@ def test_regular_warning_is_not_failure():
     )
 
 
+@pytest.mark.parametrize("existing", ["empty", "result", "symlink-plan"])
+def test_output_directory_rejects_existing_results_and_linked_plans(tmp_path, existing):
+    directory = tmp_path / "run"
+    directory.mkdir()
+    protected = tmp_path / "protected.json"
+    protected.write_text("untouched")
+    if existing == "result":
+        (directory / "resolved-config.json").write_text("old result")
+    elif existing == "symlink-plan":
+        (directory / "plan.json").symlink_to(protected)
+    with pytest.raises(FileExistsError):
+        reporting.prepare_output_directory(directory)
+    assert protected.read_text() == "untouched"
+    if existing == "result":
+        assert (directory / "resolved-config.json").read_text() == "old result"
+
+
 @pytest.mark.parametrize(
     "prefix,suffix,expected",
     [
@@ -214,6 +231,7 @@ def test_log_reader_retains_late_root_cause_and_records_profiler_advisory(tmp_pa
     process = object.__new__(runner.ManagedProcess)
     process.name, process.phase = "ffn", "inference"
     process.diagnostics = {"inference": [], "shutdown": []}
+    process.root_errors = {"inference": None, "shutdown": None}
     process.advisories, process.reader_error = [], None
     process.process = SimpleNamespace(
         stdout=io.StringIO("".join(messages)), poll=lambda: None
@@ -226,7 +244,7 @@ def test_log_reader_retains_late_root_cause_and_records_profiler_advisory(tmp_pa
     assert "EZ1013" in errors[-1]["message"]
     assert process.advisories[0]["phase"] == "inference"
     assert "profiler.py" not in "".join(error["message"] for error in errors)
-    with pytest.raises(RuntimeError, match="worker loop failed"):
+    with pytest.raises(RuntimeError, match="EZ1013"):
         process.ensure_alive()
     evidence = reporting.log_evidence(
         tmp_path,

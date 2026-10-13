@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import statistics
+from collections import Counter
 from dataclasses import asdict
 from types import SimpleNamespace
 
@@ -92,6 +93,40 @@ def test_plan_covers_lengths_concurrency_rates_and_mixed(make_case):
     assert {p["rps"] for p in pts} == {2, None}
     assert all(p["phase"] == "end-to-end" for p in pts)
     json.dumps(planned, allow_nan=False)
+
+
+@pytest.mark.parametrize("count,expected", [(8, {128: 8}), (16, {128: 13, 1024: 3})])
+def test_planned_mix_matches_actual_http_requests(make_case, count, expected):
+    case = make_case(
+        "--test", "perf", "--perf-mode", "mixed", "--perf-input-lens", "128,1024",
+        "--perf-output-lens", "4", "--perf-weights", "3,1",
+        "--perf-concurrencies", "4", "--perf-requests", str(count),
+    )
+    point = describe(case)["performance_points"][0]
+    planned = {row["input_tokens"]: row["requests"] for row in point["planned_mix"] if row["requests"]}
+    assert planned == expected
+    assert sum(row["requests"] for row in point["planned_mix"]) == count
+    assert bool(point["warnings"]) == (count == 8)
+    if count == 8:
+        assert "1024" in point["warnings"][0]
+    actual = Counter()
+
+    async def handler(request):
+        body = json.loads(request.content)
+        actual[len(body["prompt"])] += 1
+        return httpx.Response(200, stream=Chunks(sse(stream_values(len(body["prompt"]), 4))))
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            records = []
+            await performance.batch(
+                client, [{"url": "http://test", "headers": {}}], "model", [1, 2, 3],
+                point, count, "measured", 5, records, io.StringIO(), {},
+            )
+            assert all(row["status"] == "passed" for row in records)
+
+    asyncio.run(run())
+    assert dict(actual) == expected
 
 
 @pytest.mark.parametrize(

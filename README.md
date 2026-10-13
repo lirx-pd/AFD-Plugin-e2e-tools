@@ -105,6 +105,15 @@ npu run --gpus 4 --nonblock --note "AFD V2 2A2F smoke" -- \
 `npu run` 先申请设备，再设置 `ASCEND_RT_VISIBLE_DEVICES` 并运行命令；
 工具自动继承该列表，无需传入 `--device`。
 
+`plan --output DIR` 保存 `DIR/plan.json`，可重新生成计划，随后用同一个
+`run --output DIR` 执行。仅含普通 `plan.json` 文件的目录可复用；已有运行结果、
+其他文件或符号链接计划均拒绝覆盖。`run` 使用本次命令参数，不自动从计划恢复参数。
+
+```bash
+python run.py plan --device 0,1,2,3 --test smoke --output runs/smoke-check
+python run.py run  --device 0,1,2,3 --test smoke --output runs/smoke-check
+```
+
 - `--gpus N` 自动分配 N 张设备，按用户最近使用记录选卡；申请拓扑所需的最少数量。
   只有需要固定物理设备时才使用 `--gpu-ids`，并先核对当前状态；任一指定设备不可用时，整组无法申请。
 - `--nonblock` 在设备不可用时立即失败；需要排队时可改为 `--wait 5m`。
@@ -147,7 +156,7 @@ python run.py run --device 0,1,2,3 --topology 2a2f --test smoke
 | `--moe-ubatching` | Async CAM 两段 token 拆分：`on` / `off`，异步默认 on |
 | `--execution` | `eager` / `graph`，默认 eager |
 | `--limit` | GSM8K 条数 `1..1319`，默认 30；`all` 为 1319 |
-| `--test` | `smoke` / `gsm8k` / `all` / `perf`；AFD 默认 all（smoke + GSM8K），baseline 默认 perf |
+| `--test` | `smoke` / `gsm8k` / `all` / `perf`，可用逗号组合，如 `all,perf`；AFD 默认 all（smoke + GSM8K），baseline 默认 perf |
 | `--device` / `--devices` | 逗号分隔的设备编号；也可继承 `ASCEND_RT_VISIBLE_DEVICES` |
 
 ### 功能配置与验收边界
@@ -251,6 +260,9 @@ python run.py plan \
 ### 正确性测试
 
 默认 `--test all` 先运行 smoke，再运行 GSM8K；也可分别选择 `smoke` 或 `gsm8k`。
+`--test all,perf` 在同一次服务启动中依次运行 smoke、GSM8K 和性能测试，结束后统一关闭。
+GSM8K 仅因精度门槛失败时继续测性能，最终仍返回失败；请求、服务、评测执行错误或取消会中止后续测试。
+baseline 可组合 `--test smoke,perf`，仍不支持 GSM8K 多实例路由。
 以下示例通过 `npu run` 继承实际分配的设备。使用 `--device` 时，去掉外层
 `npu run ... --`，为工具传入实际设备列表；其他测试参数保持一致：
 
@@ -297,6 +309,19 @@ npu run --gpus 4 --nonblock -- python run.py run \
 使用 `--test perf`，复用原有模型、通信、MRV、DBO、Graph、设备和清理配置。
 默认依次测试各输入长度，再测试短 / 长请求混合；每种负载扫描并发上限和 RPS。
 `plan` 输出完整的 `performance_points`，可以先核对测试点数量。
+每点的 `planned_mix` 用与实际请求相同的固定种子抽样，显示每种输入 / 输出长度的
+正式请求数和比例。若正权重的长度没有抽到请求，`warnings` 会提示增加请求数或调整比例；
+随机抽样不保证小样本覆盖所有长度。运行前也显示提示，最终报告对比计划和实际长度计数。
+
+```bash
+# Run correctness and performance once; 16 requests cover both input lengths with seed 42.
+python run.py run --model v4-flash --model-path "$V4_MODEL" \
+  --device 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  --comm async --mrv mrv2 --ffn-mrv mrv1 --moe-ubatching off \
+  --test all,perf --perf-mode mixed --perf-input-lens 128,1024 \
+  --perf-weights 3,1 --perf-output-lens 32 --perf-requests 16 \
+  --perf-concurrencies 4 --rps 2 --perf-arrival burst
+```
 
 通过 `--perf-phase` 分别测试 prefill 和 decode，默认 `end-to-end` 保持原有输入 / 输出负载。
 prefill 每个请求固定输出 1 token，可扫描输入长度；decode 每个请求固定输入 1 token，
@@ -396,19 +421,23 @@ TPOT 和 `output_tokens_per_second`。decode 请求仍包含单 token 输入的 
 
 ### 结果文件
 
-结果默认写入 `runs/<唯一运行编号>/`，或指定新的 `--output` 目录：
+结果默认写入 `runs/<唯一运行编号>/`，或指定新的 / 仅含 `plan.json` 的 `--output` 目录：
 
 - `resolved-config.json`、`commands.json`：配置、启动命令与环境。
 - `manifest.json`：工具源文件哈希、可选插件 Git 状态、实际命令、域映射、分配设备、模型元数据和包版本。
 - `preflight.log`、`attention.log`、`ffn.log`、评测日志：原始输出。
 - `smoke.json`：请求、响应及错误。
 - `gsm8k/`：lm-eval 原始结果和逐条样本；精确校验数量和 strict-match。
+  `summary.gsm8k` 附最多 20 条错题的标准值、提取值、输出片段与数值等价提示；终端展示前 5 条。
+  `26.00` 与 `26` 的提示只用于解释失败，不改变官方 strict-match 或验收门槛。
+  样本日志缺失或格式不兼容时明确标注，不影响官方精度判定。
 - `performance.json`、`performance/requests.jsonl`：性能汇总及逐请求原始测量。
 - `metrics/before-*.prom`、`metrics/after-*.prom`：各 HTTP 实例在负载前后的 `/metrics` 原始快照。
   `summary.metrics` 记录每次采集的状态、路径或不可用原因；指标名称按服务端版本原样保留。
 - `report.txt`：简短结果，包含精度、条数、阈值、耗时及失败原因，结束时也输出到终端。
 - `diagnostics.json`：Attention / FFN 按推理和退出阶段记录错误，附原始日志文件名与行号；
-  每个角色、阶段最多 20 条，超过时保留最早 10 条和最新 10 条，避免重复消息挤掉后面的根因。
+  每个角色、阶段保留最早 10 条和最新 10 条，额外保留第一个具体异常（最多 21 条）；
+  失败摘要优先显示具体异常，完整栈仍保存在原始日志和 compact 证据中。
 - `advisories.json`：profiler 要求离线解析的已知提示，记录角色、阶段、文件和行号；原文仍保留在日志中。
 - `summary.json`、`exit-code.txt`：状态和失败原因。成功 0、运行失败 1、参数错误 2、正常取消 130。
 
@@ -417,6 +446,7 @@ TPOT 和 `output_tokens_per_second`。decode 请求仍包含单 token 输入的 
 运行时 `summary.json` 会原子更新当前阶段、阶段开始时间和耗时；阶段切换及等待
 预检、服务就绪、请求 / 评测期间每 15 秒输出进度，无需等整个测试结束才知道运行到了哪里。
 最终保留每个阶段的 `stage_durations`。精度未达阈值也保留实际分数和样本数。
+`test_results` 分别记录所选测试项的状态，便于区分 GSM8K 失败和性能测试通过。
 
 结果分别记录 `inference_status`、`shutdown_status` 和 `cleanup_status`：
 即使评测成功、服务主进程退出码为 0，退出时出现 ERROR、异常或强制 SIGKILL，整体仍判失败；

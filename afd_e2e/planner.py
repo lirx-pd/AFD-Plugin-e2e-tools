@@ -366,7 +366,7 @@ def describe(case: Case) -> dict:
         ],
         "unused_devices": devices[case.required_devices :],
         "performance_points": points(case.to_dict()["performance"])
-        if case.test == "perf"
+        if "perf" in case.tests
         else [],
         "notes": [
             "plan does not allocate devices or start services",

@@ -202,6 +202,32 @@ def test_run_without_devices_fails_before_creating_output(make_case, tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize(
+    "selection,expected",
+    [("all,perf", ("smoke", "gsm8k", "perf")),
+     ("perf,smoke,smoke", ("smoke", "perf"))],
+)
+def test_combined_test_selection(make_case, selection, expected):
+    case = make_case("--test", selection)
+    assert case.tests == expected
+    assert case.to_dict()["tests"] == list(expected)
+    assert describe(case)["performance_points"]
+
+
+@pytest.mark.parametrize("selection", ["unknown", "all,,perf", ""])
+def test_invalid_test_selection(make_case, selection):
+    with pytest.raises(ValueError, match="--test"):
+        make_case("--test", selection)
+
+
+def test_combined_performance_validates_context_and_baseline(make_case):
+    with pytest.raises(ValueError, match="exceeds"):
+        make_case("--test", "all,perf", "--max-model-len", "128")
+    with pytest.raises(ValueError, match="GSM8K routing"):
+        make_case("--baseline", "--test", "all,perf")
+    assert make_case("--baseline", "--test", "smoke,perf").tests == ("smoke", "perf")
+
+
 @pytest.mark.parametrize("value", [None, 3, {}, [True], [1, 1], "1,,2", "-1,2", "１,2"])
 def test_device_response_boundary(value):
     with pytest.raises(ValueError):

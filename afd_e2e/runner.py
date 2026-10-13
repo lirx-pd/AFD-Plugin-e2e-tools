@@ -17,8 +17,12 @@ from pathlib import Path
 from . import __version__, evaluation
 from .config import TOOL_ROOT, Case
 from .metrics import capture_metrics
+from .performance import points
 from .planner import Service, build_services, environment, network, runtime_environment
-from .reporting import LOG_FAILURE, is_profiler_advisory, report_text, write_json
+from .reporting import (
+    LOG_FAILURE, ROOT_EXCEPTION, is_profiler_advisory, prepare_output_directory,
+    primary_error, report_text, write_json,
+)
 from .routing import routes
 from .process_utils import (
     close_process_identities,
@@ -44,6 +48,7 @@ class ManagedProcess:
         self.reader_error: Exception | None = None
         self.phase = "inference"
         self.diagnostics = {"inference": [], "shutdown": []}
+        self.root_errors = {"inference": None, "shutdown": None}
         self.advisories = []
         self.process = subprocess.Popen(
             command,
@@ -70,23 +75,28 @@ class ManagedProcess:
                     log.write(line)
                     log.flush()
                     if LOG_FAILURE.search(line):
+                        phase = self.phase
                         advisory = is_profiler_advisory(line)
                         evidence = (
                             self.advisories
                             if advisory
-                            else self.diagnostics[self.phase]
+                            else self.diagnostics[phase]
                         )
                         # Repeated wrapper errors must not hide the later root cause.
                         if len(evidence) == 20:
                             del evidence[10]
-                        evidence.append(
-                            {
-                                "log": path.name,
-                                "line": number,
-                                "message": line.strip(),
-                                **({"phase": self.phase} if advisory else {}),
-                            }
-                        )
+                        row = {
+                            "log": path.name,
+                            "line": number,
+                            "message": line.strip(),
+                            **({"phase": phase} if advisory else {}),
+                        }
+                        evidence.append(row)
+                        if (
+                            not advisory and self.root_errors[phase] is None
+                            and ROOT_EXCEPTION.search(line)
+                        ):
+                            self.root_errors[phase] = row
                     print(f"[{self.name}] {line}", end="", flush=True)
         except Exception as exc:
             self.reader_error = exc
@@ -97,7 +107,7 @@ class ManagedProcess:
         if self.reader_error:
             raise RuntimeError(f"{self.name} log writer failed: {self.reader_error}")
         if self.diagnostics["inference"]:
-            evidence = self.diagnostics["inference"][0]
+            evidence = self.root_errors["inference"] or self.diagnostics["inference"][0]
             raise RuntimeError(
                 f"{evidence['log']}:{evidence['line']}: {evidence['message']}"
             )
@@ -254,8 +264,10 @@ def execute(case: Case) -> dict:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"{timestamp}-{uuid.uuid4().hex[:8]}"
     run_dir = case.run_dir or TOOL_ROOT / "runs" / run_id
-    run_dir.mkdir(parents=True, exist_ok=False)
+    prepare_output_directory(run_dir)
     config_path = run_dir / "resolved-config.json"
+    # Claim a plan-only directory before another run can reuse it.
+    config_path.touch(exist_ok=False)
     write_json(config_path, case.to_dict())
     summary = {
         "run_id": run_id,
@@ -270,6 +282,7 @@ def execute(case: Case) -> dict:
         "shutdown_status": "not_started",
         "cleanup_status": "not_started",
         "stage_durations": {},
+        "test_results": {kind: "not_started" for kind in case.tests},
     }
     started = stage_started = time.monotonic()
     last_progress = 0.0
@@ -327,6 +340,7 @@ def execute(case: Case) -> dict:
     children: list[ManagedProcess] = []
     services: list[ManagedProcess] = []
     history = []
+    current_test = None
     manifest = source_manifest(case)
     write_json(run_dir / "manifest.json", manifest)
     previous_handlers = {
@@ -370,6 +384,14 @@ def execute(case: Case) -> dict:
         manifest["unused_devices"] = case.devices[case.required_devices :]
         write_json(run_dir / "manifest.json", manifest)
         specifications = build_services(case, case.devices, run_id)
+        if "perf" in case.tests:
+            manifest["performance_points"] = points(case.to_dict()["performance"])
+            summary["warnings"] = list(dict.fromkeys(
+                warning for point in manifest["performance_points"]
+                for warning in point["warnings"]
+            ))
+            for warning in summary["warnings"]:
+                print(f"Warning: {warning}", flush=True)
         manifest["services"] = [service.to_dict() for service in specifications]
         manifest["routes"] = routes(case.to_dict())
         write_json(run_dir / "manifest.json", manifest)
@@ -417,62 +439,68 @@ def execute(case: Case) -> dict:
         }
         workload_started = time.time()
         summary["workload_started"] = workload_started
-        if case.test == "perf":
-            stage("performance")
-            start_job(
-                "performance",
-                (
-                    case.python,
-                    "-m",
-                    "afd_e2e.performance",
-                    "--config",
-                    str(config_path),
-                ),
-                job_env,
-                case.eval_timeout,
-            )
-        if case.test in {"smoke", "all"}:
-            stage("smoke")
-            start_workload("smoke", "smoke")
-        if case.test in {"gsm8k", "all"}:
-            if case.dataset_path:
-                stage("dataset")
+        for kind in case.tests:
+            current_test = kind
+            summary["test_results"][kind] = "running"
+            if kind == "smoke":
+                stage("smoke")
+                start_workload("smoke", "smoke")
+            elif kind == "perf":
+                stage("performance")
                 start_job(
-                    "dataset",
+                    "performance",
                     (
                         case.python,
                         "-m",
-                        "afd_e2e.evaluation",
-                        "--dataset",
-                        str(case.dataset_path),
-                        "--output",
-                        str(run_dir / "gsm8k-task"),
+                        "afd_e2e.performance",
+                        "--config",
+                        str(config_path),
                     ),
                     job_env,
-                    case.startup_timeout,
+                    case.eval_timeout,
                 )
-            stage("gsm8k")
-            start_job(
-                "evaluation",
-                evaluation.command(case, run_dir),
-                job_env,
-                case.eval_timeout,
-            )
-            try:
-                summary["gsm8k"] = evaluation.read_results(
-                    run_dir / "gsm8k", case.limit, case.threshold
+            else:
+                if case.dataset_path:
+                    stage("dataset")
+                    start_job(
+                        "dataset",
+                        (
+                            case.python, "-m", "afd_e2e.evaluation",
+                            "--dataset", str(case.dataset_path),
+                            "--output", str(run_dir / "gsm8k-task"),
+                        ),
+                        job_env, case.startup_timeout,
+                    )
+                stage("gsm8k")
+                start_job(
+                    "evaluation", evaluation.command(case, run_dir),
+                    job_env, case.eval_timeout,
                 )
-            except evaluation.AccuracyError as exc:
-                summary["gsm8k"] = exc.result
-                raise
-        for service in services:
-            service.ensure_alive()
-        summary["status"] = "passed"
+                try:
+                    summary["gsm8k"] = evaluation.read_results(
+                        run_dir / "gsm8k", case.limit, case.threshold
+                    )
+                except evaluation.AccuracyError as exc:
+                    # A score below threshold does not make the service unusable.
+                    summary["gsm8k"] = exc.result
+                    summary["test_results"][kind] = "failed"
+                    summary["status"] = "failed"
+                    summary.setdefault("failed_stage", "gsm8k")
+                    summary["errors"].append(f"AccuracyError: {exc}")
+            if summary["test_results"][kind] == "running":
+                summary["test_results"][kind] = "passed"
+            for service in services:
+                service.ensure_alive()
+            current_test = None
+        if summary["status"] == "running":
+            summary["status"] = "passed"
     except BaseException as exc:
         summary["status"] = (
             "cancelled" if isinstance(exc, KeyboardInterrupt) else "failed"
         )
-        summary["failed_stage"] = summary["stage"]
+        summary.setdefault("failed_stage", summary["stage"])
+        if current_test is not None:
+            summary["test_results"][current_test] = summary["status"]
         summary["errors"].append(f"{type(exc).__name__}: {exc}")
     finally:
         # Complete bounded cleanup even if cancellation is repeated.
@@ -498,7 +526,7 @@ def execute(case: Case) -> dict:
             case, run_id, children, services, summary["process_exit_codes"]
         )
         # A cancelled performance job saves its partial measurements while stopping.
-        if case.test == "perf":
+        if "perf" in case.tests:
             try:
                 metrics = run_dir / "performance.json"
                 if metrics.is_file():
@@ -506,12 +534,20 @@ def execute(case: Case) -> dict:
             except (OSError, ValueError) as exc:
                 summary["status"] = summary["inference_status"] = "failed"
                 summary["failed_stage"] = "performance"
+                summary["test_results"]["perf"] = "failed"
                 summary["errors"].append(f"Performance result read failed: {exc}")
         forced = [
             error for error in cleanup_failures if error.startswith("forced SIGKILL")
         ]
         cleanup_failures = [error for error in cleanup_failures if error not in forced]
-        diagnostics = {service.name: service.diagnostics for service in services}
+        diagnostics = {}
+        for service in services:
+            phases = {phase: list(rows) for phase, rows in service.diagnostics.items()}
+            for phase, root in service.root_errors.items():
+                if root and root not in phases[phase]:
+                    phases[phase].append(root)
+                    phases[phase].sort(key=lambda row: row["line"])
+            diagnostics[service.name] = phases
         summary["log_diagnostics"] = diagnostics
         summary["log_advisories"] = {
             service.name: service.advisories for service in services
@@ -521,15 +557,17 @@ def execute(case: Case) -> dict:
             for phase, evidence in phases.items():
                 if not evidence:
                     continue
-                first = evidence[0]
+                first = primary_error(evidence)
                 error = f"{phase}: {first['log']}:{first['line']}: {first['message']}"
                 if phase == "shutdown":
                     shutdown_errors.append(error)
-                elif summary["inference_status"] == "passed":
-                    summary["inference_status"] = "failed"
-                    summary["status"] = "failed"
-                    summary.setdefault("failed_stage", inference_stage)
-                    summary["errors"].append(error)
+                else:
+                    if summary["inference_status"] == "passed":
+                        summary["inference_status"] = "failed"
+                        summary["status"] = "failed"
+                        summary.setdefault("failed_stage", inference_stage)
+                    if not any(first["message"] in item for item in summary["errors"]):
+                        summary["errors"].append(error)
         summary["shutdown_status"] = "failed" if shutdown_errors else "passed"
         if shutdown_errors:
             summary["status"] = "failed"

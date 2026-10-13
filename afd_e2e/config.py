@@ -186,6 +186,15 @@ class Case:
     serve_env: tuple[str, ...]
 
     @property
+    def tests(self) -> tuple[str, ...]:
+        selected = {name.strip() for name in self.test.split(",")}
+        if not selected <= {"smoke", "gsm8k", "perf", "all"}:
+            raise ValueError("--test accepts smoke, gsm8k, perf or all, comma-separated")
+        if "all" in selected:
+            selected.update(("smoke", "gsm8k"))
+        return tuple(name for name in ("smoke", "gsm8k", "perf") if name in selected)
+
+    @property
     def attention_ranks(self) -> int:
         if self.baseline:
             return sum(dp * tp for dp, tp in self.baseline_layouts)
@@ -239,6 +248,7 @@ class Case:
             result[key] = str(result[key]) if result[key] is not None else None
         result["case_id"] = self.case_id
         result["required_devices"] = self.required_devices
+        result["tests"] = list(self.tests)
         return result
 
 
@@ -302,7 +312,7 @@ def from_args(args) -> Case:
         ),
         devices=devices,
         limit=limit,
-        test=args.test or ("perf" if args.baseline else "all"),
+        test=args.test if args.test is not None else ("perf" if args.baseline else "all"),
         performance=performance_configuration(args),
         dataset_path=args.dataset_path.resolve() if args.dataset_path else None,
         threshold=args.threshold,
@@ -344,8 +354,9 @@ def from_args(args) -> Case:
 
 
 def validate(case: Case) -> None:
+    tests = case.tests
     if (
-        case.test == "perf"
+        "perf" in tests
         and max(case.performance.input_lens) + max(case.performance.output_lens)
         > case.max_model_len
     ):
@@ -363,7 +374,7 @@ def validate(case: Case) -> None:
             "Baseline uses native vLLM-Ascend without AFD communication or splitting"
         )
     if case.baseline:
-        if case.test not in {"perf", "smoke"}:
+        if "gsm8k" in tests:
             raise ValueError("Baseline supports perf and smoke; GSM8K routing is not enabled")
     if case.comm == "sync" and case.moe_ubatching:
         raise ValueError("--moe-ubatching configures the async deployment template")

@@ -11,6 +11,7 @@ import random
 import signal
 import statistics
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,6 +20,15 @@ from .routing import routes
 
 SEED = 42
 METRICS = ("ttft_ms", "tpot_ms", "e2e_ms", "client_queue_ms", "scheduler_lag_ms")
+
+
+def request_lengths(point: dict, count: int):
+    rng = random.Random(SEED)
+    for _ in range(count):
+        yield (
+            rng.choices(point["input_lens"], weights=point["weights"])[0],
+            rng.choice(point["output_lens"]),
+        )
 
 
 def points(config: dict) -> list[dict]:
@@ -33,7 +43,7 @@ def points(config: dict) -> list[dict]:
             {key: config[key] for key in ("input_lens", "output_lens", "weights")}
             | {"mode": "mixed"}
         )
-    return [
+    result = [
         {
             "id": f"point-{index:03d}",
             **workload,
@@ -47,6 +57,28 @@ def points(config: dict) -> list[dict]:
             itertools.product(workloads, config["concurrencies"], config["rps"])
         )
     ]
+    for point in result:
+        counts = Counter(request_lengths(point, point["requests"]))
+        point["planned_mix"] = [
+            {"input_tokens": i, "output_tokens": o, "requests": counts[i, o],
+             "ratio": counts[i, o] / point["requests"]}
+            for i, o in itertools.product(point["input_lens"], point["output_lens"])
+        ]
+        missing_inputs = [
+            i for i, weight in zip(point["input_lens"], point["weights"])
+            if weight > 0 and not any(counts[i, o] for o in point["output_lens"])
+        ]
+        missing_outputs = [
+            o for o in point["output_lens"]
+            if not any(counts[i, o] for i in point["input_lens"])
+        ]
+        point["warnings"] = [
+            f"No measured requests planned for {side} lengths {missing}; "
+            "increase --perf-requests or adjust the length mix"
+            for side, missing in (("input", missing_inputs), ("output", missing_outputs))
+            if missing
+        ]
+    return result
 
 
 def distribution(values: list[float]) -> dict:
@@ -199,7 +231,7 @@ async def batch(
     import httpx
 
     semaphore = asyncio.Semaphore(point["concurrency"])
-    rng = random.Random(SEED)
+    lengths = iter(request_lengths(point, count))
     start = time.perf_counter()
     active = peak = 0
     # shortcut: exact percentiles keep all requests in memory, use disk aggregation for very large runs.
@@ -263,16 +295,15 @@ async def batch(
         ):
             await asyncio.sleep(max(0, start + scheduled - time.perf_counter()))
             now = time.perf_counter() - start
+            input_length, output_length = next(lengths)
             record = {
                 "point": point["id"],
                 "phase": phase,
                 "performance_phase": point["phase"],
                 "index": index,
                 "route": endpoints[index % len(endpoints)],
-                "input_target": rng.choices(
-                    point["input_lens"], weights=point["weights"]
-                )[0],
-                "output_target": rng.choice(point["output_lens"]),
+                "input_target": input_length,
+                "output_target": output_length,
                 "prompt_seed": SEED + index + (1000000 if phase == "warmup" else 0),
                 "scheduled_offset_s": scheduled,
                 "arrival_offset_s": now,

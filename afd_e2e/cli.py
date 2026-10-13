@@ -85,8 +85,9 @@ def parser() -> argparse.ArgumentParser:
             "--limit", default="30", help="Exact GSM8K sample count or all (1319)"
         )
         sub.add_argument(
-            "--test", choices=("smoke", "gsm8k", "all", "perf"),
-            help="Defaults to perf for baseline, all for AFD",
+            "--test",
+            help="smoke, gsm8k, perf or all (smoke+gsm8k), comma-separated; "
+                 "e.g. all,perf reuses one service startup. Defaults: AFD all, baseline perf",
         )
         sub.add_argument(
             "--perf-phase",
@@ -179,7 +180,8 @@ def parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--output",
             type=Path,
-            help="New output directory; defaults to runs/<unique-id>",
+            help="Output directory; may contain only plan.json; run never overwrites "
+                 "existing results. Defaults to runs/<unique-id>",
         )
         sub.add_argument(
             "--baseline",
@@ -231,10 +233,12 @@ def main(argv: list[str] | None = None) -> int:
             from .planner import describe
 
             result = describe(case)
-            print(json.dumps(result, ensure_ascii=False, indent=2))
             if case.run_dir:
-                case.run_dir.mkdir(parents=True, exist_ok=False)
+                from .reporting import prepare_output_directory
+
+                prepare_output_directory(case.run_dir)
                 write_json(case.run_dir / "plan.json", result)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
         from .runner import execute, exit_code
 
